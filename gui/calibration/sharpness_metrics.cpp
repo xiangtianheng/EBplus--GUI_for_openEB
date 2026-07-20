@@ -6,6 +6,12 @@
 #include <limits>
 
 #include <opencv2/imgproc.hpp>
+// OpenCV 5.0 moved the DistanceTypes enum (DIST_L2 etc.) from imgproc to the
+// new geometry module. CV_MAJOR_VERSION is provided by sharpness_metrics.h's
+// <opencv2/core.hpp> include above.
+#if CV_MAJOR_VERSION >= 5
+#include <opencv2/geometry/2d.hpp>
+#endif
 
 namespace gui {
 
