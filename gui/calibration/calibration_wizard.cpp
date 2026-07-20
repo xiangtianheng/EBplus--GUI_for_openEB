@@ -24,8 +24,18 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-#include <opencv2/calib3d.hpp>
+// OpenCV 5.0 split calib3d into calib/3d/stereo/ptcloud. The calib3d.hpp
+// shim shipped by some 5.x packagings (e.g. Homebrew) does not pull in the
+// full calib.hpp declarations, so findChessboardCorners goes missing.
+// Include <opencv2/core.hpp> first so CV_MAJOR_VERSION is defined, then
+// pick the correct calib header per OpenCV major version.
+#include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#if CV_MAJOR_VERSION >= 5
+#include <opencv2/calib.hpp>
+#else
+#include <opencv2/calib3d.hpp>
+#endif
 
 #include <algorithm>
 
