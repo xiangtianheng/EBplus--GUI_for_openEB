@@ -27,7 +27,15 @@ endif()
 # --- External dependencies -------------------------------------------------
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets Svg)
 find_package(MetavisionSDK 5.2.0 REQUIRED COMPONENTS base core stream)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d videoio)
+# OpenCV — calib3d was split into calib/3d/stereo in OpenCV 5.0; probe the
+# version first, then require the correct component names.
+find_package(OpenCV REQUIRED)
+if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
+    set(_OPENCV_CALIB_COMPONENTS calib 3d)
+else()
+    set(_OPENCV_CALIB_COMPONENTS calib3d)
+endif()
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio ${_OPENCV_CALIB_COMPONENTS})
 
 # Qt MOC / UIC / RCC auto-processing
 set(CMAKE_AUTOMOC ON)

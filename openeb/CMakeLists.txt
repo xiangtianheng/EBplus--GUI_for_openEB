@@ -226,8 +226,15 @@ if (COMPILE_PYTHON3_BINDINGS OR BUILD_TESTING)
     include(python3)
 endif ()
 
-# OpenCV
-find_package(OpenCV COMPONENTS core highgui imgproc videoio imgcodecs calib3d objdetect REQUIRED)
+# OpenCV — calib3d was split into calib/3d/stereo in OpenCV 5.0; probe the
+# version first, then require the correct component names.
+find_package(OpenCV REQUIRED)
+if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
+    set(_OPENCV_CALIB_COMPONENTS calib 3d stereo)
+else()
+    set(_OPENCV_CALIB_COMPONENTS calib3d)
+endif()
+find_package(OpenCV COMPONENTS core highgui imgproc videoio imgcodecs ${_OPENCV_CALIB_COMPONENTS} objdetect REQUIRED)
 
 # HDF5
 if (NOT ANDROID AND NOT HDF5_DISABLED)
