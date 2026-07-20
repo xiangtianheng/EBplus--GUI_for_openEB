@@ -31,7 +31,18 @@ find_package(MetavisionSDK 5.2.0 REQUIRED COMPONENTS base core stream)
 # version first, then require the correct component names.
 find_package(OpenCV REQUIRED)
 if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
-    set(_OPENCV_CALIB_COMPONENTS calib 3d)
+    # OpenCV 5.0 split calib3d into multiple modules (calib, 3d/geometry,
+    # stereo, ptcloud). The exact names vary across 5.x packaging — the
+    # "3d" module was renamed to "geometry" before the final 5.0.0 release,
+    # and Homebrew's opencv 5.0.0 does not expose a "3d" component. Probe
+    # which components are actually provided and only require those that
+    # exist, so the build works across OpenCV 5.x packaging variants.
+    set(_OPENCV_CALIB_COMPONENTS "")
+    foreach(_comp calib 3d geometry stereo ptcloud)
+        if(TARGET opencv_${_comp})
+            list(APPEND _OPENCV_CALIB_COMPONENTS ${_comp})
+        endif()
+    endforeach()
 else()
     set(_OPENCV_CALIB_COMPONENTS calib3d)
 endif()
