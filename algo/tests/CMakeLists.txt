@@ -2,17 +2,6 @@
 
 find_package(GTest REQUIRED)
 
-set(ALGO_TEST_COMPILE_OPTIONS -Wall -Wextra -Werror)
-if(APPLE)
-    # AppleClang diagnoses these existing header-only implementation details
-    # more aggressively than the Linux toolchains used for the project.
-    list(APPEND ALGO_TEST_COMPILE_OPTIONS
-        -Wno-error=unused-private-field
-        -Wno-error=unused-lambda-capture
-        -Wno-error=unused-but-set-variable
-    )
-endif()
-
 # Test executable for Phase 6 (algo/common/) modules.
 add_executable(test_phase6_common
     test_phase6_common.cpp
@@ -24,7 +13,7 @@ target_link_libraries(test_phase6_common PRIVATE
     GTest::Main
 )
 
-target_compile_options(test_phase6_common PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
+target_compile_options(test_phase6_common PRIVATE -Wall -Wextra -Werror)
 
 include(GoogleTest)
 gtest_discover_tests(test_phase6_common)
@@ -43,7 +32,7 @@ target_link_libraries(test_phase7_cv PRIVATE
     GTest::Main
 )
 
-target_compile_options(test_phase7_cv PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
+target_compile_options(test_phase7_cv PRIVATE -Wall -Wextra -Werror)
 
 gtest_discover_tests(test_phase7_cv)
 
@@ -64,7 +53,7 @@ target_link_libraries(test_phase8_10 PRIVATE
     GTest::Main
 )
 
-target_compile_options(test_phase8_10 PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
+target_compile_options(test_phase8_10 PRIVATE -Wall -Wextra -Werror)
 
 gtest_discover_tests(test_phase8_10)
 
@@ -214,3 +203,4 @@ target_link_libraries(test_loop_flip PRIVATE
     MetavisionSDK::stream
     ${OpenCV_LIBS}
 )
+
