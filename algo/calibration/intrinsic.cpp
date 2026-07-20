@@ -2,13 +2,16 @@
 
 #include "intrinsic.h"
 
-// OpenCV 5.0 split calib3d into calib/3d/stereo/ptcloud. The calib3d.hpp
-// shim shipped by some 5.x packagings (e.g. Homebrew) does not pull in the
-// full calib.hpp declarations, so chessboard/calibrateCamera symbols go
-// missing. Include the new calib.hpp directly on v5+; fall back to the
-// historical calib3d.hpp on v4.x. CV_MAJOR_VERSION is provided by
-// intrinsic.h's <opencv2/core.hpp> include above.
+// OpenCV 5.0 split calib3d across multiple modules: calibrateCamera stayed in
+// the new calib module, while the chessboard/circle-grid pattern detection
+// functions (findChessboardCorners, drawChessboardCorners, findCirclesGrid,
+// CALIB_CB_*) moved to objdetect. The calib3d.hpp shim shipped by some 5.x
+// packagings (e.g. Homebrew) does not pull in the full declarations, so on
+// v5+ we include both objdetect.hpp and calib.hpp directly. On v4.x the
+// historical calib3d.hpp still has everything. CV_MAJOR_VERSION is provided
+// by intrinsic.h's <opencv2/core.hpp> include above.
 #if CV_MAJOR_VERSION >= 5
+#include <opencv2/objdetect.hpp>
 #include <opencv2/calib.hpp>
 #else
 #include <opencv2/calib3d.hpp>
