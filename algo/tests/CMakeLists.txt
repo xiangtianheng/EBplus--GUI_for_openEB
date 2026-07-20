@@ -66,7 +66,7 @@ target_link_libraries(test_phase8_10 PRIVATE
 
 target_compile_options(test_phase8_10 PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
 
-gtest_discover_tests(test_phase8_10)
+gtest_discover_tests(test_phase8_10 DISCOVERY_TIMEOUT 60)
 
 # Raw-event integration tests: exercises every streaming algorithm against a
 # real Metavision .raw recording (algo/tests/sparklers.raw, committed). Unlike
