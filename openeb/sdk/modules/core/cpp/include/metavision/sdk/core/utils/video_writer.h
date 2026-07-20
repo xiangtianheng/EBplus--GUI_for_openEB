@@ -177,7 +177,7 @@ public:
     The function/method writes the specified image to video file. It must have the same size as has
     been specified when opening the video writer.
      */
-    virtual void write(cv::InputArray image);
+    virtual bool write(cv::InputArray image);
 
     /** @brief Sets a property in the VideoWriter.
 

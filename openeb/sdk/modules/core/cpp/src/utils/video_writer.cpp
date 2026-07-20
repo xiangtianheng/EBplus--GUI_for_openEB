@@ -51,7 +51,12 @@
 //M*/
 
 #include <opencv2/videoio.hpp>
+// Note: <opencv2/core/types_c.h> was removed in OpenCV 5.0 (the entire C API
+// was dropped). Nothing from that legacy header is used in this file, so the
+// include is simply omitted on OpenCV >= 5.
+#if CV_MAJOR_VERSION < 5
 #include <opencv2/core/types_c.h>
+#endif
 
 #include "metavision/sdk/base/utils/sdk_log.h"
 #include "metavision/sdk/core/utils/video_writer.h"
@@ -343,15 +348,19 @@ cv::String VideoWriter::getBackendName() const {
 #endif
 }
 
-void VideoWriter::write(cv::InputArray image) {
+bool VideoWriter::write(cv::InputArray image) {
     if (writer_) {
         writer_->write(image);
-        return;
+        return true;
     }
-#if CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2
+#if CV_MAJOR_VERSION >= 5
+    return cv::VideoWriter::write(image);
+#elif CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2
     cv::VideoWriter::write(image.getMat(-1));
+    return true;
 #else
     cv::VideoWriter::write(image);
+    return true;
 #endif
 }
 
