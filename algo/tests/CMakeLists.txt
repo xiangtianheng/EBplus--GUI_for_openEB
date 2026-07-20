@@ -27,7 +27,7 @@ target_link_libraries(test_phase6_common PRIVATE
 target_compile_options(test_phase6_common PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
 
 include(GoogleTest)
-gtest_discover_tests(test_phase6_common)
+ebplus_gtest_discover_tests(test_phase6_common)
 
 # Test executable for Phase 7-9 (algo/cv/) modules.
 # Depends on algo/cv/ headers (noise_filter, hot_pixel_filter, orientation_filter,
@@ -45,7 +45,7 @@ target_link_libraries(test_phase7_cv PRIVATE
 
 target_compile_options(test_phase7_cv PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
 
-gtest_discover_tests(test_phase7_cv)
+ebplus_gtest_discover_tests(test_phase7_cv)
 
 # Test executable for Phase 8-10 (algo/cv/ + algo/analytics/) modules.
 # Depends on algo/cv/ and algo/analytics/ headers (line_segment_detector,
@@ -66,7 +66,7 @@ target_link_libraries(test_phase8_10 PRIVATE
 
 target_compile_options(test_phase8_10 PRIVATE ${ALGO_TEST_COMPILE_OPTIONS})
 
-gtest_discover_tests(test_phase8_10)
+ebplus_gtest_discover_tests(test_phase8_10)
 
 # Raw-event integration tests: exercises every streaming algorithm against a
 # real Metavision .raw recording (algo/tests/sparklers.raw, committed). Unlike
@@ -98,7 +98,7 @@ target_compile_definitions(test_raw_algos PRIVATE
 
 target_compile_options(test_raw_algos PRIVATE -Wall -Wextra)
 
-gtest_discover_tests(test_raw_algos)
+ebplus_gtest_discover_tests(test_raw_algos)
 
 # Standalone diagnostic: feed .raw events to EventToVideo and report stats.
 add_executable(test_raw_e2v

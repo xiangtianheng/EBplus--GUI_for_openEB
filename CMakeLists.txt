@@ -61,6 +61,18 @@ set(CMAKE_AUTORCC ON)
 # gui/tests gtest_discover_tests() calls (design §3.11) register with CTest.
 enable_testing()
 
+# GTest discovery launches each test binary while the build is still running.
+# Apple Silicon can take longer than CMake's five-second default to load the
+# bundled OpenEB and Qt dependency graph.
+set(EBPLUS_GTEST_DISCOVERY_TIMEOUT 60 CACHE STRING
+    "Seconds allowed for GTest test-case discovery")
+function(ebplus_gtest_discover_tests target)
+    gtest_discover_tests(${target}
+        DISCOVERY_TIMEOUT ${EBPLUS_GTEST_DISCOVERY_TIMEOUT}
+        ${ARGN}
+    )
+endfunction()
+
 add_subdirectory(algo)
 add_subdirectory(gui)
 

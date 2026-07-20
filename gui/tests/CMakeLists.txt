@@ -22,7 +22,7 @@ target_link_libraries(test_theme_tokens PRIVATE
     GTest::Main
 )
 target_compile_options(test_theme_tokens PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_theme_tokens)
+ebplus_gtest_discover_tests(test_theme_tokens)
 
 # --- test_icon_provider: embedded SVGs render through QtSvg. ---
 add_executable(test_icon_provider
@@ -34,7 +34,7 @@ target_link_libraries(test_icon_provider PRIVATE
     GTest::GTest
 )
 target_compile_options(test_icon_provider PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_icon_provider
+ebplus_gtest_discover_tests(test_icon_provider
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
 
@@ -48,7 +48,7 @@ target_link_libraries(test_algo_bridge PRIVATE
     GTest::Main
 )
 target_compile_options(test_algo_bridge PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_algo_bridge)
+ebplus_gtest_discover_tests(test_algo_bridge)
 
 # --- test_config_manager: algorithm-state serialization round-trip. ---
 add_executable(test_config_manager
@@ -60,7 +60,7 @@ target_link_libraries(test_config_manager PRIVATE
     GTest::Main
 )
 target_compile_options(test_config_manager PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_config_manager)
+ebplus_gtest_discover_tests(test_config_manager)
 
 # --- test_layout_manager: layout save/load symmetry (needs QApplication). ---
 # Custom main() creates an offscreen QApplication before InitGoogleTest, so we
@@ -73,7 +73,7 @@ target_link_libraries(test_layout_manager PRIVATE
     GTest::GTest
 )
 target_compile_options(test_layout_manager PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_layout_manager
+ebplus_gtest_discover_tests(test_layout_manager
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
 
@@ -86,7 +86,7 @@ target_link_libraries(test_display_strategy PRIVATE
     GTest::GTest
 )
 target_compile_options(test_display_strategy PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_display_strategy
+ebplus_gtest_discover_tests(test_display_strategy
     PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
 )
 
@@ -100,4 +100,4 @@ target_link_libraries(test_sharpness_metrics PRIVATE
     GTest::Main
 )
 target_compile_options(test_sharpness_metrics PRIVATE ${GUI_TEST_COMPILE_OPTS})
-gtest_discover_tests(test_sharpness_metrics)
+ebplus_gtest_discover_tests(test_sharpness_metrics)
