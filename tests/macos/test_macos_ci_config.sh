@@ -9,7 +9,7 @@ require_count() {
     local needle="$1"
     local expected="$2"
     local actual
-    actual="$(rg -F -c -- "$needle" "$workflow" || true)"
+    actual="$(grep -F -c -- "$needle" "$workflow" || true)"
     actual="${actual:-0}"
     [[ "$actual" -eq "$expected" ]] || {
         printf 'Expected %s occurrences of %s in %s; found %s\n' \
@@ -18,6 +18,7 @@ require_count() {
     }
 }
 
-require_count 'brew install cmake qtbase qtsvg opencv@4 boost libusb protobuf abseil gcc' 3
+require_count 'opencv@4' 7
+require_count 'brew install cmake qtbase qtsvg opencv@4 boost libusb protobuf abseil gcc ripgrep' 1
 require_count 'OPENCV_PREFIX="$(brew --prefix opencv@4)"' 3
 require_count '$(brew --prefix opencv@4);$(brew --prefix)' 1
