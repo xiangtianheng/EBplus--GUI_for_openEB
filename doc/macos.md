@@ -8,7 +8,8 @@ Upstream is [Ziqing7226/EBplus__more-than-gui-for-openeb](https://github.com/Ziq
 whose development branch is `main` (there is no `master` branch). macOS
 integration and synchronization pull requests live in
 [xiangtianheng/EBplus--GUI_for_openEB](https://github.com/xiangtianheng/EBplus--GUI_for_openEB)
-and target `develop-MacOS`. Keep upstream updates and the macOS overlay
+and target the fork's `main`, which intentionally includes macOS support.
+Upstream `main` remains platform-neutral. Keep upstream updates and the macOS overlay
 reviewable as described in `AGENTS.md`.
 
 ## Scope
@@ -159,8 +160,9 @@ The macOS CI limits compilation to three jobs per runner and cancels older
 runs of the same pull request or branch. Local builds default to the host's
 logical CPU count; `CMAKE_BUILD_PARALLEL_LEVEL` overrides it.
 
-The macOS CI checks pull requests into `develop-MacOS` and pushes to that
-branch. Successful app jobs upload `EBplus-macos-arm64-app.zip`, created with
+The macOS CI checks pull requests into the fork's `main` and pushes to that
+branch, while retaining `develop-MacOS` triggers for existing integration work.
+Successful app jobs upload `EBplus-macos-arm64-app.zip`, created with
 `ditto` so the bundle retains executable permissions and symbolic links after
 download. The independent test job runs the complete CTest suite.
 

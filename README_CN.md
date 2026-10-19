@@ -46,7 +46,7 @@
 
 ## 快速开始
 
-Apple Silicon macOS 的适配在 fork 的 `develop-MacOS` 分支维护，构建与测试见
+Apple Silicon macOS 的适配在 fork 的 `main` 分支维护，构建与测试见
 [macOS 指南](doc/macos.md)。下方命令对应上游 Linux 环境。
 
 ```bash

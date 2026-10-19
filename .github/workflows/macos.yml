@@ -2,9 +2,9 @@ name: macOS
 
 on:
   pull_request:
-    branches: [develop-MacOS]
+    branches: [main, develop-MacOS]
   push:
-    branches: [develop-MacOS]
+    branches: [main, develop-MacOS]
     tags: ["v*"]
   workflow_dispatch:
 

@@ -42,7 +42,7 @@ The whole project is open source — feel free to fork it and adapt it to whatev
 
 ## Quick Start
 
-For Apple Silicon macOS, use the fork's `develop-MacOS` integration line and
+For Apple Silicon macOS, use the fork's `main` integration line and
 the [macOS build and test guide](doc/macos.md). The instructions below describe
 the upstream Linux environment.
 
