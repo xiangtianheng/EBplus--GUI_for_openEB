@@ -18,6 +18,7 @@
 
 #include <metavision/sdk/base/events/event_cd.h>
 
+#include "algo_bridge/algo_backend.h"
 #include "algo_bridge/algo_bridge.h"
 
 using gui::AlgoBridge;
@@ -42,28 +43,38 @@ std::vector<EventCD> make_events(std::size_t n, int w = 1280, int h = 720) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Registry completeness (§3.11.2: 28 self + 8 openEB). noise_filter was
+// Registry completeness (§3.11.2: 28 self + 4 openEB). noise_filter was
 // removed in v1.0.9 (now a stackable preprocessing stage); sensor_self_test
 // was added in §4.4.8; intrinsic_calibration was removed (now a Tools-menu
 // wizard, not a registered algo); perspective_undistort was removed (audit
-// §3-B8, superseded by the preproc undistort stage); the 22 unreachable
+// §三-B8, superseded by the preproc undistort stage); the 22 unreachable
 // OpenEB frame/preproc/util/roi_mask/adaptive_rate_split registrations were
-// removed (audit §3-B6/7), leaving the 8 FilterChain event-transform stages
-// (roi_filter, polarity_filter, polarity_invert, flip_x, flip_y, rotate,
-// transpose, rescale). Live registry: 28 self-developed + 8 OpenEB = 36.
+// removed (audit §三-B6/7), leaving the FilterChain event-transform stages
+// (polarity_filter, polarity_invert, flip_x, flip_y — roi_filter was removed
+// in Phase 2.6 debug D-6, superseded by the unified ROI; rotate/transpose/
+// rescale were removed 2026-08-18 for coordinate-OOB heap corruption).
+// ultra_slow_motion was removed in Phase 2.5 (broken
+// Replace-display promise, no downstream consumer). particle_counter,
+// flow_statistics and overlay were removed 2026-08-22 (user decision:
+// particle_counter fully self-invented, flow_statistics needed unavailable
+// ground truth, overlay was a pass-through placeholder; isi_analyzer /
+// trigger_synced / active_marker were self-invented or input-less). sensor_self_test is
+// intentionally NOT registered (it is a Devices-panel diagnostic, not an
+// algorithm — its instance is created via create_with_info).
+// Live registry: 20 self-developed + 4 OpenEB = 24.
 // ---------------------------------------------------------------------------
 TEST(AlgoBridgeRegistry, ListsAllRegisteredAlgos) {
     AlgoBridge bridge;
     const auto algos = bridge.list_algos();
-    EXPECT_EQ(algos.size(), 36u);
+    EXPECT_EQ(algos.size(), 25u);
 
     std::size_t self_count = 0, openeb_count = 0;
     for (const auto& a : algos) {
         if (a.source == "self") ++self_count;
         else if (a.source == "openeb") ++openeb_count;
     }
-    EXPECT_EQ(self_count, 28u);
-    EXPECT_EQ(openeb_count, 8u);
+    EXPECT_EQ(self_count, 21u);
+    EXPECT_EQ(openeb_count, 4u);
 }
 
 TEST(AlgoBridgeRegistry, KeyNamesPresent) {
@@ -75,24 +86,50 @@ TEST(AlgoBridgeRegistry, KeyNamesPresent) {
     EXPECT_NE(bridge.find("hough_line"), nullptr);
     EXPECT_NE(bridge.find("time_surface"), nullptr);
     EXPECT_NE(bridge.find("blob_detector"), nullptr);
-    EXPECT_NE(bridge.find("sensor_self_test"), nullptr);
-    // OpenEB event-transform stages (handled by FilterChain).
-    EXPECT_NE(bridge.find("roi_filter"), nullptr);
+    // sensor_self_test is intentionally NOT registered (Devices-panel
+    // diagnostic, not an algorithm) — but its instance must still be
+    // creatable from an explicit AlgoInfo via create_with_info.
+    EXPECT_EQ(bridge.find("sensor_self_test"), nullptr);
+    // OpenEB event-transform stages (handled by FilterChain). roi_filter is
+    // intentionally NOT registered (Phase 2.6 debug D-6 — superseded by the
+    // unified ROI).
+    EXPECT_EQ(bridge.find("roi_filter"), nullptr);
     EXPECT_NE(bridge.find("flip_x"), nullptr);
     EXPECT_NE(bridge.find("polarity_filter"), nullptr);
 }
 
+TEST(AlgoBridgeInstances, SensorSelfTestCreatableWithoutRegistration) {
+    AlgoBridge bridge;
+    gui::AlgoInfo a;
+    a.name = "sensor_self_test";
+    a.display_name = "Sensor Self-Test";
+    a.category = "devices";
+    a.source = "self";
+    a.display_mode = gui::AlgoDisplayMode::Standalone;
+    auto inst = bridge.find_or_create_with_info(a);
+    ASSERT_NE(inst, nullptr);
+    EXPECT_EQ(inst->info().name, "sensor_self_test");
+    // find_or_create_with_info returns the same live instance on repeat.
+    auto inst2 = bridge.find_or_create_with_info(a);
+    EXPECT_EQ(inst.get(), inst2.get());
+}
+
 TEST(AlgoBridgeRegistry, RemovedRegistrationsAreGone) {
     AlgoBridge bridge;
-    // Audit §3-B6/7: unreachable OpenEB backends removed.
+    // Audit §三-B6/7: unreachable OpenEB backends removed.
     EXPECT_EQ(bridge.find("frame_integration"), nullptr);
     EXPECT_EQ(bridge.find("preproc_diff"), nullptr);
     EXPECT_EQ(bridge.find("preproc_hw_diff"), nullptr);
     EXPECT_EQ(bridge.find("util_rate_estimator"), nullptr);
     EXPECT_EQ(bridge.find("roi_mask"), nullptr);
     EXPECT_EQ(bridge.find("adaptive_rate_split"), nullptr);
-    // Audit §3-B8: superseded by the preproc undistort stage.
+    // Audit §三-B8: superseded by the preproc undistort stage.
     EXPECT_EQ(bridge.find("perspective_undistort"), nullptr);
+    // 2026-08-18: coordinate-changing transforms removed (OOB heap
+    // corruption — no frame-geometry propagation to downstream buffers).
+    EXPECT_EQ(bridge.find("rotate"), nullptr);
+    EXPECT_EQ(bridge.find("transpose"), nullptr);
+    EXPECT_EQ(bridge.find("rescale"), nullptr);
 }
 
 TEST(AlgoBridgeRegistry, NoiseFilterRemovedInV1_0_9) {
@@ -119,6 +156,21 @@ TEST(AlgoBridgeRegistry, EventToVideoIsRegistered) {
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->source, "self");
     EXPECT_FALSE(info->params.empty());
+}
+
+// §五-H1: the "model_loaded" pseudo-param is not a registered key — it is
+// served by the backend fallback in AlgoInstance::get_param that was added
+// for it. In E2VID mode (the default) the value is "true"/"false" depending
+// on whether the ONNX file at model_path could be loaded; it must never be
+// empty.
+TEST(AlgoBridgeInstances, EventToVideoModelLoadedPseudoParam) {
+    AlgoBridge bridge;
+    auto inst = bridge.find_or_create("event_to_video");
+    ASSERT_NE(inst, nullptr);
+    const std::string v = inst->get_param("model_loaded");
+    EXPECT_TRUE(v == "true" || v == "false")
+        << "model_loaded must be reachable via the backend fallback, got: '"
+        << v << "'";
 }
 
 // ---------------------------------------------------------------------------
@@ -187,22 +239,69 @@ TEST(AlgoBridgeInstances, ParamRoundTrip) {
     AlgoBridge bridge;
     auto inst = bridge.find_or_create("hot_pixel_filter");
     ASSERT_NE(inst, nullptr);
-    inst->set_param("fpn_target_rate_hz", "250");
+    inst->set_param("fpn_alpha", "0.5");
     inst->set_param("learning_window_s", "10.0");
-    EXPECT_EQ(inst->get_param("fpn_target_rate_hz"), "250");
+    EXPECT_EQ(inst->get_param("fpn_alpha"), "0.5");
     EXPECT_EQ(inst->get_param("learning_window_s"), "10.0");
     // Unknown key returns an empty string.
     EXPECT_EQ(inst->get_param("no_such_key"), "");
+
+    // sparse flow (P7): BlockMatch params now registered + round-trip; the
+    // arrow scale param round-trips too.
+    // blob_detector (P leftover 2): accumulation_ms / min_area now registered
+    // and round-trip through the backend.
+    auto bl = bridge.find_or_create("blob_detector");
+    ASSERT_NE(bl, nullptr);
+    bl->set_param("accumulation_ms", "50");
+    bl->set_param("min_area", "25");
+    EXPECT_EQ(bl->get_param("accumulation_ms"), "50");
+    EXPECT_EQ(bl->get_param("min_area"), "25");
+
+    auto sf = bridge.find_or_create("sparse_optical_flow");
+    ASSERT_NE(sf, nullptr);
+    sf->set_param("bm_time_window_us", "33000");
+    sf->set_param("num_scales", "4");
+    sf->set_param("pps_scale_lk", "0.5");  // per-mode arrow scale (LK mode)
+    EXPECT_EQ(sf->get_param("bm_time_window_us"), "33000");
+    EXPECT_EQ(sf->get_param("num_scales"), "4");
+    EXPECT_EQ(sf->get_param("pps_scale_lk"), "0.5");
+
+    // direction_selective: embedded orientation pre-stage params round-trip
+    // (jAER enclosed SimpleOrientationFilter alignment).
+    auto ds = bridge.find_or_create("direction_selective");
+    ASSERT_NE(ds, nullptr);
+    ds->set_param("ori_min_dt_threshold_us", "2000");
+    ds->set_param("ori_dt_reject_threshold_us", "300000");
+    EXPECT_EQ(ds->get_param("ori_min_dt_threshold_us"), "2000");
+    EXPECT_EQ(ds->get_param("ori_dt_reject_threshold_us"), "300000");
+}
+
+// time_surface decay/tau_us/refresh_rate_hz must round-trip through the
+// TimeSurfaceBackend into the algo (Phase 6-3).
+TEST(AlgoBridgeInstances, TimeSurfaceDecayParamsRoundTrip) {
+    AlgoBridge bridge;
+    auto inst = bridge.find_or_create("time_surface");
+    ASSERT_NE(inst, nullptr);
+    // Registered defaults are applied at construction.
+    EXPECT_EQ(inst->get_param("decay"), "0");
+    EXPECT_EQ(inst->get_param("tau_us"), "100000");
+    EXPECT_EQ(inst->get_param("refresh_rate_hz"), "30");
+    inst->set_param("decay", "1");
+    inst->set_param("tau_us", "200000");
+    inst->set_param("refresh_rate_hz", "60");
+    EXPECT_EQ(inst->get_param("decay"), "1");
+    EXPECT_EQ(inst->get_param("tau_us"), "200000");
+    EXPECT_EQ(inst->get_param("refresh_rate_hz"), "60");
 }
 
 TEST(AlgoBridgeInstances, DefaultsAppliedAtConstruction) {
     AlgoBridge bridge;
     auto inst = bridge.find_or_create("hot_pixel_filter");
     ASSERT_NE(inst, nullptr);
-    // The default fpn_target_rate_hz declared in the registry is "100".
-    EXPECT_EQ(inst->get_param("fpn_target_rate_hz"), "100");
+    // The default fpn_alpha declared in the registry is "0.9".
+    EXPECT_EQ(inst->get_param("fpn_alpha"), "0.9");
     // n_sigma was removed from the registry (algo marks it unused, audit
-    // §3-31) — it is now an unknown key and returns an empty string.
+    // §三-31) — it is now an unknown key and returns an empty string.
     EXPECT_EQ(inst->get_param("n_sigma"), "");
 }
 
@@ -217,18 +316,62 @@ TEST(AlgoBridgeInstances, EnableDisableState) {
     EXPECT_FALSE(inst->is_enabled());
 }
 
+// P6-A stream write-back: a filtering algorithm (hot_pixel_filter) exposes a
+// per-batch output span after push_events; an annotating detector
+// (blob_detector) exposes none (nullptr = pass-through, the display keeps
+// the conditioned span). Disabled instances never expose a span.
+TEST(AlgoBridgeInstances, OutputSpanFilterVsDetector) {
+    AlgoBridge bridge;
+
+    auto filt = bridge.find_or_create("hot_pixel_filter");
+    ASSERT_NE(filt, nullptr);
+    filt->set_enabled(true);
+    {
+        auto [fb, fn] = filt->output_span();
+        EXPECT_EQ(fb, nullptr);
+        EXPECT_EQ(fn, 0u);
+    }
+    auto evs = make_events(100);
+    filt->push_events(evs.data(), evs.data() + evs.size());
+    {
+        auto [fb, fn] = filt->output_span();
+        ASSERT_NE(fb, nullptr);
+        EXPECT_LE(fn, evs.size());
+        // Span points at the kept events: contents are in-bounds EventCDs.
+        for (std::size_t i = 0; i < fn; ++i) {
+            EXPECT_GE(fb[i].x, 0);
+        }
+    }
+    filt->set_enabled(false);
+    {
+        auto [fb, fn] = filt->output_span();
+        EXPECT_EQ(fb, nullptr);
+    }
+
+    auto det = bridge.find_or_create("blob_detector");
+    ASSERT_NE(det, nullptr);
+    det->set_enabled(true);
+    det->push_events(evs.data(), evs.data() + evs.size());
+    {
+        auto [fb, fn] = det->output_span();
+        EXPECT_EQ(fb, nullptr);  // detectors annotate, they don't filter
+        EXPECT_EQ(fn, 0u);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Flood guard (design §5.6.7, rate-based): the instance measures the
 // wall-clock event rate over a sliding 1s window; when the rate exceeds
 // kMaxEventRateEvPerSec (30 Mev/s) for 4 consecutive windows the instance is
 // auto-disabled. Batches are never truncated (the old batch-cap guard that
-// silently dropped window-front events was removed, audit §5-E1).
+// silently dropped window-front events was removed, audit §五-E1).
 // ---------------------------------------------------------------------------
 TEST(AlgoBridgeFloodGuard, OverloadsAfterSustainedHighRate) {
     AlgoBridge bridge;
-    // The overlay backend is the cheapest (ROI filter + copy), so a tight
-    // push loop sustains far more than the 30 Mev/s threshold.
-    auto inst = bridge.find_or_create("overlay");
+    // The blob_detector backend is among the cheapest (per-event count
+    // accumulation), so a tight push loop sustains far more than the
+    // 100 Mev/s threshold.
+    auto inst = bridge.find_or_create("blob_detector");
     ASSERT_NE(inst, nullptr);
     inst->set_enabled(true);
     ASSERT_FALSE(inst->is_overloaded());
@@ -274,4 +417,35 @@ TEST(AlgoBridgeFloodGuard, ModerateRateDoesNotOverload) {
     // Batches are never truncated: nothing was dropped.
     EXPECT_EQ(inst->total_pushed(), 60000u);
     EXPECT_EQ(inst->total_dropped(), 0u);
+}
+
+TEST(AlgoBridgeBackends, OpticalFlowPpsScaleKeysMapToDistinctSlots) {
+    // Backend-level check (instance-level get_param reads the param cache,
+    // which masked this): the ctor replays every registered default through
+    // set_param while mode is still 0, so a backend that slots pps_scale_*
+    // by the CURRENT mode ends up with the last default (co/tm) in slot 0
+    // and the GUI-vs-backend values diverge. Slots must follow the key.
+    const auto backend = gui::create_algo_backend("sparse_optical_flow", 64, 64);
+    ASSERT_NE(backend, nullptr);
+    backend->set_param("pps_scale_lp", "0.003");
+    backend->set_param("pps_scale_lk", "0.7");
+    backend->set_param("pps_scale_bm", "0.09");
+    backend->set_param("pps_scale_co", "0.05");
+    const auto expect_val = [](gui::AlgoBackend& b, const char* key, double want) {
+        EXPECT_NEAR(std::stod(b.get_param(key)), want, 1e-9) << key;
+    };
+    backend->set_param("mode", "1");  // switch away from LocalPlanes
+    expect_val(*backend, "pps_scale_lp", 0.003);
+    expect_val(*backend, "pps_scale_lk", 0.7);
+    backend->set_param("mode", "0");
+    expect_val(*backend, "pps_scale_lp", 0.003);
+
+    const auto dense = gui::create_algo_backend("dense_optical_flow", 64, 64);
+    ASSERT_NE(dense, nullptr);
+    dense->set_param("pps_scale_pf", "0.002");
+    dense->set_param("pps_scale_tg", "0.007");
+    dense->set_param("pps_scale_tm", "0.009");
+    dense->set_param("mode", "2");
+    expect_val(*dense, "pps_scale_pf", 0.002);
+    expect_val(*dense, "pps_scale_tm", 0.009);
 }

@@ -14,7 +14,6 @@
 
 class QCheckBox;
 class QSpinBox;
-class QDoubleSpinBox;
 class QComboBox;
 class QGroupBox;
 
@@ -27,8 +26,14 @@ class PreprocessingPanel : public AbstractPanel {
 public:
     explicit PreprocessingPanel(QWidget* parent = nullptr);
 
+    // Stable id "preprocessing" (layout/panel registry key) — do NOT rename.
     QString panel_id() const override { return QStringLiteral("preprocessing"); }
-    QString panel_title() const override { return tr("Preprocessing"); }
+    // User-visible title: "Display Transform" distinguishes these OpenEB
+    // event-transform stages from the AlgorithmsPanel "Preprocessing" stages
+    // (filter/downsample/undistort). NOTE: both reach the display AND every
+    // algorithm instance — the FilterChain output is shared (so Replace-mode
+    // output keeps the display orientation).
+    QString panel_title() const override { return tr("Display Transform"); }
     QString panel_group() const override { return QStringLiteral("Algorithms"); }
 
 public slots:
@@ -52,7 +57,6 @@ private:
     QHash<QString, QCheckBox*> enables_;
     QHash<QString, QComboBox*> combos_;
     QHash<QString, QSpinBox*> spins_;
-    QHash<QString, QDoubleSpinBox*> double_spins_;
     QGroupBox* group_{nullptr};
 };
 

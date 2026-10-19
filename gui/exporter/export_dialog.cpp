@@ -62,8 +62,10 @@ ExportDialog::ExportDialog(ExporterController* controller, QWidget* parent)
     connect(btn_out, &QPushButton::clicked, this, &ExportDialog::on_browse_output);
 
     cmb_format_ = new QComboBox(this);
-    cmb_format_->addItem(tr("HDF5 (.h5)"), static_cast<int>(ExportParams::Format::HDF5));
     cmb_format_->addItem(tr("AVI (.avi)"),  static_cast<int>(ExportParams::Format::AVI));
+    cmb_format_->addItem(tr("HDF5 (.h5)"), static_cast<int>(ExportParams::Format::HDF5));
+    // AVI first = default: HDF5 export needs the HDF5 ECF plugin, which is
+    // not available in every deployment (user report), while AVI always works.
     form->addRow(tr("Format:"), cmb_format_);
     connect(cmb_format_, qOverload<int>(&QComboBox::currentIndexChanged),
             this, &ExportDialog::on_format_changed);
@@ -151,7 +153,7 @@ void ExportDialog::set_source(const QString& path) {
 void ExportDialog::on_browse_source() {
     const QString p = QFileDialog::getOpenFileName(
         this, tr("Select source"), QString(),
-        tr("Event files (*.raw *.hdf5 *.h5 *.dat);;All files (*)"));
+        tr("Event files (*.raw *.hdf5 *.h5 *.dat *.aedat4 *.alpdata);;All files (*)"));
     if (!p.isEmpty()) edt_source_->setText(p);
 }
 
@@ -208,6 +210,11 @@ void ExportDialog::on_start() {
     p.accumulation_us = spn_accum_->value();
     p.quality = spn_quality_->value();
     p.color = chk_color_->isChecked();
+    // Skip the blocking OSC duration query when the duration is already
+    // known (e.g. exporting the currently-open, fully buffered file).
+    if (duration_provider_) {
+        p.duration_us = duration_provider_(p.source_path);
+    }
     progress_->setValue(0);
     lbl_status_->setText(tr("Exporting..."));
     btn_start_->setEnabled(false);

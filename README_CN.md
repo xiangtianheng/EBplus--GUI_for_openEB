@@ -4,12 +4,12 @@
 
 基于 [openEB](https://github.com/prophesee-ai/openeb) v5.2.0 的开源 Qt 6 事件相机桌面应用。
 
-实时可视化 · 相机控制 · 录制回放 · 标定 · 36 个算法 · 可定制主题
+实时可视化 · 相机控制 · 录制回放 · 标定 · 25 个算法 · 可定制主题
 
 ![License](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B17-Qt%206-orange)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
-![Version](https://img.shields.io/badge/version-1.9.0-blue)
+![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Version](https://img.shields.io/badge/version-3.0.0-blue)
 
 ![主界面](pic/1.9.0.png)
 
@@ -17,15 +17,25 @@
 
 ---
 
+## 3.0.0 新特性
+
+- **Inivation 实时相机**：DAVIS240A/B/C、DAVIS346、DAVIS640、CDAVIS 与 DVXplorer 直连——事件流、完整偏置控制（含 Auto Bias）、DAVIS 硬件 ROI、IMU 三维姿态视图，以及 APS 帧预览（支持的传感器上为彩色）
+- **IMU 姿态链重构**：打开即对齐、静止自动回正、闭环路径可回位；IMU 与 APS 视图改为可停靠侧栏
+- **AEDAT4 录制**（inivation 相机，DV 原生且可互操作）可选携带 IMU 样本与 APS 帧，回放时如实机一般呈现；DV 的 LZ4 压缩录制可直接打开
+- **标定**的 Auto Bias 区间与事件缓冲随相机分辨率自适应；square size 工作流不再丢弃抓拍
+- **能力感知 UI**：相机缺少对应硬件时面板自动隐藏
+
+---
+
 ## 这是什么？
 
-**EB plus** 是一个美观、开源、功能丰富的事件相机 GUI 工具，支持 Prophesee / CenturyArks 事件相机。事件相机不采集帧——它以微秒级时间分辨率逐像素报告亮度变化。EB plus 提供完整的事件数据桌面工作流：
+**EB plus** 是一个美观、开源、功能丰富的事件相机 GUI 工具，支持 Prophesee / CenturyArks / inivation DAVIS / DVXplorer 事件相机。事件相机不采集帧——它以微秒级时间分辨率逐像素报告亮度变化。EB plus 提供完整的事件数据桌面工作流：
 
 - **实时显示** 事件流（OpenGL，60+ FPS）
 - **控制相机** —— biases、ROI、抗闪烁、触发
-- **录制与回放** RAW 事件文件，支持速度控制与跳转
+- **录制与回放** 事件文件（RAW，以及 AEDAT4、ALPDATA 录制中的事件流），支持速度控制与跳转
 - **运行算法** —— 噪声过滤、光流、目标跟踪、事件转视频等
-- **标定相机** —— 闪烁棋盘格向导 + 锐度计
+- **标定相机** —— 棋盘格向导
 - **导出** 为 HDF5 / CSV / AVI
 
 本项目完全开源，欢迎 fork 并按需修改。
@@ -35,6 +45,9 @@
 ---
 
 ## 快速开始
+
+Apple Silicon macOS 的适配在 fork 的 `develop-MacOS` 分支维护，构建与测试见
+[macOS 指南](doc/macos.md)。下方命令对应上游 Linux 环境。
 
 ```bash
 # 编译
@@ -47,7 +60,18 @@ cmake --build build -- -j$(nproc)
 
 启动脚本会自动处理 Wayland 兼容、HAL 插件路径和 OpenGL 后端选择。
 
-> **环境要求**：Ubuntu 22.04+ · GCC 13+ · Qt 6 · OpenCV 4。详见 [doc/compile.md](doc/compile.md)。
+> **环境要求**：Ubuntu 26.04 · GCC 15 · Qt 6 · OpenCV 4——即本项目的实测构建环境（详见 [wiki/compile.md](wiki/compile.md)）。
+
+### 连接 inivation DAVIS / DVXplorer 相机（可选，初步支持）
+
+**初步支持** inivation DAVIS240A/B/C、DAVIS346、DAVIS640、CDAVIS 与 DVXplorer——实时事件流、完整偏置控制（含 Auto Bias）、DAVIS 硬件 ROI、IMU 姿态视图与 APS 帧预览（支持的传感器上为彩色），以及 DV 原生 AEDAT4 录制（事件 + IMU + APS）。240/640/CDAVIS 型号遵循参考实现但尚未经过真机测试；本 GUI 仍以 **Prophesee** 相机为主要适配与测试对象。一次性安装 USB 访问规则：
+
+```bash
+sudo cp gui/davis/66-inivation.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+拔插一次相机，然后在设备面板连接。此功能可选：缺少 libusb-1.0 开发文件时构建会自动排除。详见 [wiki/Getting-Started.md](wiki/Getting-Started.md)。
 
 ---
 
@@ -60,7 +84,7 @@ cmake --build build -- -j$(nproc)
 - 实时统计：事件率、ON/OFF 比、FPS、时间戳
 
 ### 相机控制面板
-- **Biases 面板** —— 动态枚举所有 HAL bias，滑块 + 精确输入 + Reset，保存/加载 `.bias` 文件
+- **Biases 面板** —— 动态枚举所有 HAL bias，滑块 + 精确输入 + Reset，保存/加载 `.bias` 文件，Auto Bias 速率区间控制
 - **ROI 面板** —— 多矩形 ROI / RONI（`I_ROI`），显示区拖拽选区
 - **ESP 面板** —— Anti-Flicker（模式/频带/预设/占空比/阈值）、Trail Filter（类型/阈值）、ERC（目标事件率）
 - **Trigger 面板** —— Trigger In（逐通道启用）+ Trigger Out（启用/周期/占空比）
@@ -68,7 +92,7 @@ cmake --build build -- -j$(nproc)
 所有面板在设备不支持对应 HAL facility 时优雅降级（如文件回放时四个硬件面板自动禁用）。
 
 ### 录制与回放
-- RAW 录制 —— 实时相机流录制，带实时缓冲刷新
+- RAW 录制 —— 实时相机流录制，带实时缓冲刷新（inivation 相机：DV 原生 AEDAT4，可选携带 IMU / APS 流）
 - 文件回放 —— 速度控制、跳转、暂停/恢复、位置追踪
 - 文件裁剪 —— 从事件文件中提取时间段
 
@@ -77,60 +101,83 @@ cmake --build build -- -j$(nproc)
 - 事件数据导出为 AVI 视频（可配置 FPS、累积时间、画质、色彩模式）
 
 ### 事件预处理滤波链
-8 级可叠加阶段，线程安全管线：Polarity Filter、Polarity Invert、Flip X、Flip Y、Rotate、Transpose、Rescale、ROI Filter。从侧栏切换。
+4 级可叠加阶段，线程安全管线：Polarity Filter、Polarity Invert、Flip X、Flip Y。从侧栏切换。
 
-### 算法（共 36 项）
-EB plus 内置 **28 个自研算法** + **8 项 openEB 滤波/变换阶段**，全部注册在统一的 `AlgoBridge` 注册表中。
+### 算法（共 25 项）
+EB plus 内置 **21 个自研算法** + **4 项 openEB 滤波阶段**，全部注册在统一的 `AlgoBridge` 注册表中。
 
 | 类别 | 示例 |
 |------|------|
-| **滤波** | Hot Pixel Filter、Background Mask、Bandpass Filter、Trigger Synced |
+| **滤波** | Hot Pixel Filter、Background Mask |
 | **运动** | Sparse Optical Flow（4 模式）、Direction Selective、EIS / Optical Gyro |
-| **检测** | Blob Detector、Corner Detector（EndStopped/TypeCoincidence/Harris）、Line Segment（ELiSeD）|
-| **跟踪** | Object Tracker（RCT/Median/Kalman/MultiHypothesis）、Hough Circle、Hough Line、Active Marker |
-| **重建** | Event-to-Video —— **E2VID**（默认，DL）、BardowVariational、InteractingMaps |
-| **分析** | Frequency Detector、Flow Statistics、ISI Analyzer、Particle Counter、Auto Bias |
-| **可视化** | Time Surface、XYT 3D 点云、Ultra Slow Motion、Orientation Cluster |
+| **检测** | Blob Detector、Corner Detector（Harris/FAST/AGAST）、Line Segment（ELiSeD）|
+| **跟踪** | Object Tracker（RCT，对齐 jAER）、Hough Circle、Hough Line |
+| **重建** | Event-to-Video —— **E2VID / E2VID+ / FireNet+ / HyperE2VID**（DL 模式）、BardowVariational、InteractingMaps |
+| **DL 光流** | Dense Optical Flow (DL) —— EVFlowNet，HSV 编码稠密光流 |
+| **分析** | Frequency Detector、Frequency Map |
+| **可视化** | Time Surface、XYT 3D 点云、Orientation Cluster |
+| **标定** | Intrinsic Calibration（闪烁棋盘格）|
 
-算法**互斥**——启用一个会禁用上一个。每个自研算法支持**全局 ROI**（默认中心 128×128）和共享的 **"ROI → 噪声滤波 → 1/4 下采样 → 去畸变"** 预处理阶段以控制计算量。噪声滤波、下采样、去畸变三个阶段均**默认关闭**。所有算法参数仅在**侧栏**（`AlgorithmsPanel`）调节；算法显示窗口只展示标题与输出，避免两处独立参数面板不同步。
+算法**互斥**——启用一个会禁用上一个。计算密集算法会自动启用**居中的 256×144 统一 ROI**（禁用时恢复原状），所有算法共享 **"ROI → 噪声滤波 → 1/4 下采样"** 预处理阶段以控制计算量。所有算法参数仅在**侧栏**（`AlgorithmsPanel`）调节；算法显示窗口只展示标题与输出，避免两处独立参数面板不同步。
 
 #### 噪声滤波（共享预处理）
 8 种模式按所选滤波器在侧栏暴露：BAF、STCF、Refractory、DWF、AgePolarity、Harmonic、Repetitious、SpatialBP。
 
-#### E2VID 神经网络重建（默认模式）
+#### 神经网络重建（E2VID 系列）与 DL 光流
 
-Event-to-Video 算法默认使用 **E2VID** —— 从原始事件流重建灰度图像的深度学习模型，移植自 [rpg_e2vid](https://github.com/uzh-rpg/rpg_e2vid)，通过 ONNX Runtime（多线程 CPU）推理。
+Event-to-Video 算法默认使用 **E2VID**，共提供 **4 种 DL 模式**（GUI 内切换，各模式拥有独立模型文件，可并存多套权重），另有非 DL 的 BardowVariational / InteractingMaps 模式。独立的 **Dense Optical Flow (DL)** 算法将 EVFlowNet 的逐像素光流渲染为按方向编码的 HSV 帧。
 
-**部署**（一次性，约 5 分钟）：
+| 模式 | 模型 | 参考（论文 / 仓库） | 预训练权重 |
+|------|------|---------------------|------------|
+| 2 = E2VID（默认） | UNetRecurrent | [rpg_e2vid](https://github.com/uzh-rpg/rpg_e2vid) — Gallego 等, 2019 | [E2VID_lightweight.pth.tar](http://rpg.ifi.uzh.ch/data/E2VID/models/E2VID_lightweight.pth.tar) |
+| 3 = E2VID+ | FlowNet（联合头） | [event_cnn_minimal](https://github.com/TimoStoff/event_cnn_minimal) — Stoffregen 等, ECCV 2020 | [模型包](https://drive.google.com/open?id=1J6PbqYPOGlyspYsdH4fgg5pZpc_l-BOD) → `reconstruction_model.pth` |
+| 4 = FireNet+ | FireNet（约 4 万参数） | 同上 | 同上 → `firenet_all_cts.pth` |
+| 5 = HyperE2VID | 超网络 UNet | [HyperE2VID](https://github.com/ercanburak/HyperE2VID) — Ercan 等, IEEE TIP 2024 | [model.pth](https://drive.google.com/drive/folders/1UuGnKwSz5C9di-cVH1QzSFjgTRNqpYep) |
+| DL 光流 | EVFlowNet | event_cnn_minimal（架构：Zhu 等, 2018） | 同上 → `flow_model.pth` |
+
+**部署**（一次性，约 10 分钟）：
 
 ```bash
-# 1. 下载 ONNX Runtime 1.19.2（Linux x64 CPU）到 third_party/
 cd /path/to/GUI-for-openEB
+
+# 1. ONNX Runtime 1.19.2（CPU）装入 third_party/
 mkdir -p third_party/onnxruntime && cd third_party/onnxruntime
 wget https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-linux-x64-1.19.2.tgz
 tar xzf onnxruntime-linux-x64-1.19.2.tgz --strip-components=1
 cd ../..
 
-# 2. 创建 Python 转换环境
+# 2.（可选，核显加速）OpenVINO + Intel 计算驱动 —— 见 wiki/compile.md G4b
+
+# 3. 模型转换用 Python venv
 python3 -m venv .venv && . .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu onnx onnxscript onnxruntime numpy
+pip install torch --index-url https://download.pytorch.org/whl/cpu onnx onnxscript onnxruntime numpy scipy
 deactivate
 
-# 3. 下载 PyTorch 预训练权重（约 41 MB）
-wget -P models/ http://rpg.ifi.uzh.ch/data/E2VID/models/E2VID_lightweight.pth.tar
+# 4. 参考仓库（转换脚本运行时导入；本仓库不分发）
+git clone --depth 1 https://github.com/uzh-rpg/rpg_e2vid ref/rpg_e2vid
+git clone --depth 1 https://github.com/TimoStoff/event_cnn_minimal ref/event_cnn_minimal
+git clone --depth 1 https://github.com/ercanburak/HyperE2VID ref/HyperE2VID
 
-# 4. 转换为 ONNX（生成 models/e2vid_lightweight.onnx）
-. .venv/bin/activate && python models/convert_to_onnx.py && deactivate
+# 5. 下载权重（见上表链接）放入 models/
 
-# 5. 重新编译（CMake 自动检测 ONNX Runtime）
+# 6. 转换为 ONNX
+. .venv/bin/activate
+python models/convert_to_onnx.py --input models/E2VID_lightweight.pth.tar --output models/e2vid_lightweight.onnx
+python models/convert_event_cnn_minimal_to_onnx.py --model e2vid_plus   --input reconstruction_model.pth --output models/e2vid_plus.onnx
+python models/convert_event_cnn_minimal_to_onnx.py --model firenet_plus --input firenet_all_cts.pth      --output models/firenet_plus.onnx
+python models/convert_event_cnn_minimal_to_onnx.py --model evflownet    --input flow_model.pth           --output models/evflownet.onnx
+python models/convert_hypere2vid_to_onnx.py        --input model.pth                                    --output models/hypere2vid.onnx
+deactivate
+
+# 7. 重新编译（CMake 自动检测 ONNX Runtime / OpenVINO）
 cmake --build build -- -j$(nproc)
 ```
 
-完成后启动 EB plus，启用 **Algorithm → Event → Video** 即默认 E2VID 模式（128×128 ROI、24fps）。启用共享的 **1/4 下采样**预处理阶段（默认关闭）可在 64×64 推理 → 上采样回 128×128（约 4 倍加速）。E2VID 推理在**后台 worker 线程**运行，UI 不卡顿；当推理慢于事件率时丢弃最旧批次，状态栏显示 `dropped=N`。GUI 暴露可调参数：模型路径、auto-HDR、锐化强度、双边滤波。
+GUI 中：**Algorithm → Event → Video**（默认 E2VID 模式：128×128 ROI、30fps、1/4 下采样），在侧栏选择模式；每个 DL 模式暴露各自的模型路径。**Dense Optical Flow (DL)** 在统一 ROI 上运行并内部 1/4 下采样。所有 DL 推理在可用时走核显（Inference device = Auto，OpenVINO），否则回退 ONNX Runtime CPU。
 
-> **无 ONNX Runtime 时**：E2VID 自动回退到启发式模式（体素网格求和 + Sigmoid）。BardowVariational 和 InteractingMaps 模式无需任何额外依赖——BardowVariational 通过 Chambolle-Pock 原始-对偶优化联合估计光流与亮度（六个 λ 正则化项），InteractingMaps 使用六张互连图（I/G/V/F/C/R）交替松弛，旋转由线性最小二乘估计。
+> **无 ONNX Runtime 时**：E2VID 自动回退到启发式模式（体素网格求和 + Sigmoid）。BardowVariational 和 InteractingMaps 无需任何额外依赖。
 
-详见 [doc/design.md §4.4.2](doc/design.md)。
+> **第三方模型声明**：EB plus **不分发**任何预训练权重或参考源码——转换脚本针对你自行克隆到 `ref/` 的参考仓库运行，权重从上方官方链接下载。被引用代码的许可证：rpg_e2vid = GPL-3.0（仅在转换时、在你机器上、由你的克隆被导入）；event_cnn_minimal = 无 LICENSE 文件（作者以科研用途分享权重）；HyperE2VID = MIT。预训练权重均为学术发布；商用前请自行核实相应许可与专利状况。
 
 ### 主题
 - **5 种背景色**：Gray、Green、Yellow、Pink、Blue（默认）
@@ -158,74 +205,18 @@ GUI-for-openEB/
 │   ├── algo_bridge/      # 算法注册表 + 滤波链
 │   ├── recorder/         # RAW 录制 & 回放
 │   ├── exporter/         # HDF5/CSV/AVI 导出
-│   ├── calibration/      # 内参向导（闪烁棋盘）+ 锐度计
-│   └── widgets/          # 标题栏、ActivityBar、AlgoWindow
-├── algo/              # 自研算法库（28 模块）
+│   ├── calibration/      # 内参向导
+│   └── widgets/          # 标题栏、ActivityBar、AlgoWindow、像素探针
+├── algo/              # 自研算法库（29 模块）
 ├── openeb/            # openEB SDK（Apache 2.0，v5.2.0）
 ├── models/            # E2VID PyTorch → ONNX 转换
 ├── run.sh             # 启动脚本（环境变量设置）
-├── doc/               # 设计规格 + 编译指南 + wiki
-│   └── macos.md       # macOS Apple Silicon 打包指南
+├── wiki/              # 文档：编译指南、算法、架构
 └── pic/               # 截图
 ```
 
 ---
 
-## 环境要求
-
-| 组件 | 版本 |
-|------|------|
-| 操作系统 | Ubuntu 26.04（或兼容 Linux）；macOS Apple Silicon 见 [doc/macos.md](doc/macos.md) |
-| 编译器 | GCC 15+ |
-| CMake | 4.x |
-| Qt | 6.x（Widgets、OpenGL、OpenGLWidgets） |
-| OpenEB SDK | 5.2.0（已作为子树包含） |
-| OpenCV | 4.x |
-| Python | 3.12（仅在从源码编译 openEB 时需要） |
-
-详见 [doc/compile.md](doc/compile.md) 和 [doc/macos.md](doc/macos.md)，包含 GCC 15 `<cstdint>` 修复、Python 3.12 说明和 macOS 打包流程。
-
----
-
-## 编译
-
-```bash
-# 1. 确保 openEB SDK 已安装（见 doc/compile.md）
-# 2. 配置
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-# 3. 编译
-cmake --build build -- -j$(nproc)
-```
-
-编译产物输出到 `build/gui/gui_for_openeb`。
-
----
-
-## macOS Apple Silicon
-
-macOS 打包路径会优先构建仓库内的 `openeb/`，并生成 `.app` 和 `.dmg`：
-
-```bash
-brew install cmake qtbase qtsvg opencv boost libusb protobuf abseil gcc
-./scripts/build_macos_app.sh
-open build/dist/EBplus.app
-```
-
-产物：
-
-- `build/dist/EBplus.app`
-- `build/dist/EBplus-macos-arm64.dmg`
-
-打包会携带 Qt SVG 运行时，确保左侧 activity bar 图标正常显示。默认产物只包含通用 OpenEB plugin；silkyCam 等厂商 plugin 仅可作为本地测试时的显式附加项，确认源代码和再分发条款前不会进入 CI 或公开 DMG：
-
-```bash
-EXTRA_HAL_PLUGIN_PATHS="/path/to/silkycam/hal/plugins" ./scripts/build_macos_app.sh
-```
-
-当前 macOS 包不支持 HDF5；详细说明见 [doc/macos.md](doc/macos.md)，包括签名、notarization、依赖检查、插件分发边界和 HDF5 限制。
-
----
 ## 运行
 
 ### 方式一：启动脚本（推荐）
@@ -291,6 +282,13 @@ EB plus 正在持续开发中，可能仍存在 BUG。如果你在使用过程�
 
 - **项目原创代码**：[MIT](LICENSE)
 - **openEB SDK**：[Apache 2.0](openeb/licensing/LICENSE_OPEN) —— 版权归 Prophesee 所有
+- **Inivation 实时相机支持**（`gui/davis/`）：协议、寄存器表与默认值移植自
+  [dv-processing](https://gitlab.com/inivation/dv/dv-processing)
+  （[Apache 2.0](https://gitlab.com/inivation/dv/dv-processing/-/blob/master/LICENSE)，© iniVation AG）——各文件内含出处声明
+- **对齐 jAER 的算法**：参考行为来自
+  [jAER](https://github.com/jaer-project/jaer3)（[LGPL-2.1](ref/jaer/COPYING)）——全部为重新实现,未内置任何源码
+- **DV GUI**：未使用。iniVation 的 dv-gui 使用自定义（非标准）许可证;
+  IMU 可视化为全新实现,仅共享通用的滚动曲线概念
 
 ---
 

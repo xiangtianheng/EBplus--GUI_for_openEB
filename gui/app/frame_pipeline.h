@@ -23,8 +23,11 @@
 
 #include <QObject>
 #include <QImage>
+#include <QTimer>
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <metavision/sdk/base/utils/timestamp.h>
@@ -32,6 +35,7 @@
 
 #include "algo/common/frame_generator.h"
 #include "file_frame_generator.h"
+#include "frame_mode_renderer.h"
 
 namespace gui {
 
@@ -64,11 +68,79 @@ public:
     void set_fps_limit(std::uint16_t limit);
     void set_color_palette(Metavision::ColorPalette palette);
 
+    /// @brief Selects the display frame mode (DisplayPanel "Frame mode").
+    /// Integration keeps the existing CDFrameGenerator / palette-render paths;
+    /// the other modes route events through FrameModeRenderer (live: a timer
+    /// at fps; file: per-window inside render_frame).
+    void set_frame_mode(FrameMode mode);
+    FrameMode frame_mode() const { return frame_mode_; }
+    /// @brief Decay time (µs) for the TimeDecay / EventsIntegration modes.
+    void set_frame_decay_time_us(Metavision::timestamp us);
+
     /// @brief Sets the FilterChain for file-mode display filtering. Applied
-    /// per-frame in FileFrameGenerator::render_frame() so flip/rotate/etc.
+    /// per-frame in FileFrameGenerator::render_frame() so flip etc.
     /// take effect immediately during file playback. Must be called before
     /// start_file() to ensure the pointer is available when rendering begins.
     void set_file_filter_chain(FilterChain* fc);
+
+    /// @brief Forwards a preproc_* conditioning parameter to the FILE
+    /// generator's StreamConditioner (the live conditioner is fed directly by
+    /// CameraController::set_conditioner_param).
+    void set_file_conditioner_param(const std::string& key,
+                                    const std::string& value) {
+        file_generator_.set_conditioner_param(key, value);
+    }
+
+    /// @brief Clears the file conditioner's temporal state (seek/loop).
+    void reset_file_conditioner() { file_generator_.reset_conditioner(); }
+
+    /// @brief Forwards the per-window algorithm feed hook to the file
+    /// generator (P6-A file-mode write-back): the callback is invoked inside
+    /// render_frame() so a stream-filter algorithm's output repaints the
+    /// displayed frame during playback.
+    void set_file_algo_feed_callback(
+        std::function<std::pair<const Metavision::EventCD*, std::size_t>()> cb) {
+        file_generator_.set_algo_feed_callback(std::move(cb));
+    }
+
+    /// @brief Tells the display path where the unified ROI sits. When the
+    /// ROI is active the display renders on the FULL-sensor frame (ROI
+    /// content shifted back to its absolute position; the rest stays the
+    /// palette background — pre-rework visuals, kept because the ROI
+    /// overlay / Zoom-to-ROI crop / Replace-composite strategies are all
+    /// built around full frames). The canonical conditioned stream (what
+    /// algorithms and the conditioner itself use) stays ROI-relative — the
+    /// shift is display-only. No-op semantics for RONI (absolute already).
+    /// Live: applied in add_events(); file: forwarded to the generator.
+    void set_display_roi_origin(bool active, int x0, int y0);
+
+    /// @brief Sets the file-mode software ROI (Phase 2.6): same semantics as
+    /// the hardware ROI — the FileFrameGenerator only renders/emits events
+    /// inside the rect (or outside it when @p roni is true, Phase 2.6 debug
+    /// D-5). Live mode ignores this (hardware ROI handles it).
+    void set_file_roi(bool enabled, int x, int y, int w, int h, bool roni = false) {
+        file_generator_.set_display_roi(enabled, x, y, w, h, roni);
+    }
+
+    /// @brief Reads the file-mode software ROI state (computed rect).
+    void file_roi(bool& enabled, int& x0, int& y0, int& x1, int& y1) const {
+        file_generator_.display_roi(enabled, x0, y0, x1, y1);
+    }
+
+    /// @brief True when the file-mode software ROI is in RONI mode.
+    bool file_roi_roni() const { return file_generator_.display_roi_roni(); }
+
+    /// @brief Registers a listener for the display-path event stream
+    /// (processed-stream recording). The listener receives every batch the
+    /// display sees — the conditioned span (raw when no stage is active, so
+    /// recording stays continuous across toggles), on the SDK CD thread
+    /// under processed_mutex_. Live mode only (file-source recording is
+    /// blocked upstream).
+    void set_processed_events_listener(
+        std::function<void(const Metavision::EventCD*, const Metavision::EventCD*)> cb) {
+        std::lock_guard<std::mutex> lk(processed_mutex_);
+        processed_listener_ = std::move(cb);
+    }
 
     // --- File playback control (file mode only) ---
 
@@ -93,6 +165,8 @@ signals:
     void fps_changed(std::uint16_t fps);
     void accumulation_time_changed(Metavision::timestamp us);
     void fps_limit_changed(std::uint16_t limit);
+    /// Emitted when the display frame mode changes (DisplayPanel selector).
+    void frame_mode_changed(FrameMode mode);
     /// File mode: emitted after each frame with cursor position + duration.
     void file_position_changed(Metavision::timestamp pos, Metavision::timestamp dur);
     /// File mode: emitted when playback reaches the end of the buffer.
@@ -122,7 +196,16 @@ signals:
 private:
     void recreate_window();
     std::uint16_t clamp_fps(std::uint16_t fps) const;
+    /// @brief Starts/stops the live-mode frame-mode tick based on the current
+    /// mode + fps. No-op in file mode (render_frame drives generation there).
+    void update_frame_mode_timer();
 
+private slots:
+    /// @brief Live-mode tick for non-integration frame modes: generate the
+    /// current mode's frame from the accumulated events and emit frame_ready.
+    void on_frame_mode_tick();
+
+private:
     // Live mode backend
     std::unique_ptr<gui_algo::FrameGenerator> generator_;
     int window_id_{-1};
@@ -136,6 +219,32 @@ private:
     std::uint16_t fps_{30};
     Metavision::timestamp accumulation_us_{33000};
     std::uint16_t fps_limit_{60};
+
+    // Frame-mode rendering (non-integration modes).
+    FrameMode frame_mode_{FrameMode::Integration};
+    FrameModeRenderer frame_mode_renderer_;
+    QTimer* frame_mode_timer_{nullptr};
+    /// Color palette forwarded to the TimeDecay visualization.
+    Metavision::ColorPalette palette_{Metavision::ColorPalette::Dark};
+    /// Timestamp of the last event fed to the renderer (SDK thread) — used as
+    /// the frame timestamp by the live mode tick (GUI thread).
+    std::atomic<Metavision::timestamp> last_ev_ts_{0};
+
+    // Display-side ROI placement: origin to add back to the conditioned
+    // ROI-relative events for the DISPLAY feeds (live). GUI-thread setter,
+    // SDK-thread reader — plain ints are set before the pipeline starts or
+    // between batches from the GUI thread; add_events tolerates either value.
+    bool display_roi_active_{false};
+    int display_roi_x0_{0};
+    int display_roi_y0_{0};
+    std::vector<Metavision::EventCD> display_shift_buf_;
+
+    /// Processed-stream listener (processed-stream recording), invoked under
+    /// processed_mutex_. Events arrive already conditioned
+    /// (CameraController::conditioner_).
+    std::mutex processed_mutex_;
+    std::function<void(const Metavision::EventCD*, const Metavision::EventCD*)>
+        processed_listener_;
 };
 
 } // namespace gui

@@ -1,11 +1,13 @@
 // algo/cv/blob_detector.h — connected-component blob detection with background model.
 //
-// Self-developed (design §4.3.10). Accumulates events into a count frame over
-// an accumulation window, separates foreground from a learned background model
-// (Histogram2DFilter-style EMA, approximating the rolling HxW event-count
-// histogram), thresholds and runs cv::connectedComponents, then filters blobs
-// by minimum area. Output is a vector of bounding boxes for overlay.
-// Header-only.
+// Self-developed (design §4.3.10). Accumulates events into a per-pixel count
+// frame over an accumulation window (default 33.3 ms), separates foreground
+// from a learned EMA background model (accum - EMA(accum) > threshold — a
+// frame-differencing novelty detector, NOT jAER Histogram2DFilter, which has
+// no background subtraction/EMA; the faithful H2F port is
+// background_mask_filter), thresholds the residual and runs
+// cv::connectedComponents, then filters blobs by minimum area. Output is a
+// vector of bounding boxes for overlay. Header-only.
 
 #ifndef GUI_ALGO_CV_BLOB_DETECTOR_H
 #define GUI_ALGO_CV_BLOB_DETECTOR_H
@@ -44,13 +46,11 @@ public:
     void set_accumulation_ms(double v) { accumulation_ms_ = clamp_d(v, 1.0, 1000.0); }
     void set_threshold(int v) { threshold_ = clamp_i(v, 1, 254); }
     void set_min_area(int v) { min_area_ = clamp_i(v, 1, 100000); }
-    void set_histogram_window_s(double v) { histogram_window_s_ = clamp_d(v, 0.1, 10.0); }
     void set_learning_rate(double v) { learning_rate_ = clamp_d(v, 1e-6, 1.0); }
 
     double accumulation_ms() const { return accumulation_ms_; }
     int threshold() const { return threshold_; }
     int min_area() const { return min_area_; }
-    double histogram_window_s() const { return histogram_window_s_; }
     double learning_rate() const { return learning_rate_; }
     int width() const { return width_; }
     int height() const { return height_; }
@@ -165,9 +165,8 @@ private:
     int width_;
     int height_;
     double accumulation_ms_{33.3};
-    int threshold_{50};
+    int threshold_{5};
     int min_area_{10};
-    double histogram_window_s_{1.0};
     double learning_rate_{0.05};
 
     cv::Mat accum_;        // CV_32FC1 event-count accumulator

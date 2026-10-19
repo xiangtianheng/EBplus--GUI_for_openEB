@@ -1,7 +1,7 @@
 // algo/cv/noise_filter.h — multi-mode event noise filter.
 //
 // Event noise filter (design §4.3.5) porting the jAER filter suite
-// (net/sf/jaer/eventprocessing/filter/). Provides 8 denoising modes:
+// (net/sf/jaer/eventprocessing/filter/). Provides 9 denoising modes:
 //   BAF          — Background Activity Filter (Delbruck 2008): 3x3 neighbour
 //                  correlation within dt_us.
 //   STCF         — SpatioTemporal Correlation Filter (Guo & Delbruck 2022):
@@ -16,12 +16,19 @@
 //                  sums neighbour age scores (1 - dt/tau) over a square
 //                  neighbourhood; passes when the score reaches threshold.
 //   Harmonic     — ✅ 移植自 jAER HarmonicFilter: a global driven damped
-//                  oscillator resonant at the mains frequency filters out
-//                  events near zero crossings of the oscillator.
+//                  oscillator resonant at DOUBLE the line frequency (line
+//                  doubling; ON/OFF activity peaks alternate at 2x line)
+//                  filters out events near zero crossings of the oscillator.
 //   Repetitious  — drops events recurring at a learned per-pixel ISI
 //                  (port of jAER RepetitiousFilter).
 //   SpatialBP    — center/surround time-surface differencing (port of jAER
 //                  SpatialBandpassFilter: surround-timestamp splat).
+//   KNoise       — ✅ 移植自 dv-processing KNoiseFilter (Khodamoradi &
+//                  Kastner, "O(N)-Space Spatiotemporal Filter", 2021):
+//                  one memory cell per row and per column (W+H cells, no
+//                  per-pixel surface); an event passes when any of the 3
+//                  neighbouring row/column cells reports a recent same-
+//                  polarity event within 1 px along the other axis.
 // Two common options link to the rest of the pipeline: filter_hot_pixels
 // (internal n_sigma hot-pixel suppression, see §4.3.6) and
 // adaptive_correlation_time (scales the active time threshold by the local
@@ -58,6 +65,7 @@ public:
         Harmonic,       ///< ✅ 移植自 jAER HarmonicFilter
         Repetitious,    ///< Periodic repetition filter (jAER port)
         SpatialBP,      ///< Spatial band-pass (jAER port)
+        KNoise,         ///< ✅ 移植自 dv-processing KNoiseFilter
     };
 
     enum class LineFreq { Hz50, Hz60 };
@@ -81,6 +89,8 @@ public:
         }
         dwf_init();
         harm_recompute();
+        knoise_init();
+        sbp_rebuild_offsets();
     }
 
     // Mode + common options ------------------------------------------------
@@ -115,7 +125,7 @@ public:
 
     // DWF (✅ 移植自 jAER DoubleWindowFilter) -------------------------------
     void set_dwf_window_length(int v) {
-        const int nv = clamp_i(v, 2, 4096);
+        const int nv = clamp_i(v, 1, 4096);
         if (nv != dwf_wlen_) { dwf_wlen_ = nv; dwf_init(); }
     }
     void set_dwf_dist_threshold(int v) { dwf_dis_thr_ = clamp_i(v, 1, 1024); }
@@ -151,18 +161,43 @@ public:
     // Repetitious (jAER port) ----------------------------------------------
     void set_ratio_shorter(int v) { rep_ratio_shorter_ = clamp_i(v, 1, 100); }
     void set_ratio_longer(int v) { rep_ratio_longer_ = clamp_i(v, 1, 100); }
+    void set_rep_averaging_samples(int v) {
+        rep_averaging_samples_ = clamp_i(v, 1, 100);  // jAER setAveragingSamples
+    }
+    int rep_averaging_samples() const { return rep_averaging_samples_; }
     int ratio_shorter() const { return rep_ratio_shorter_; }
     int ratio_longer() const { return rep_ratio_longer_; }
     void set_min_dt_to_store_us(int v) { rep_min_dt_to_store_ = clamp_i(v, 0, 1000000); }
     int min_dt_to_store_us() const { return rep_min_dt_to_store_; }
 
     // SpatialBP (jAER port) ------------------------------------------------
-    void set_center_radius_px(int v) { sbp_center_ = clamp_i(v, 1, 10); }
-    void set_surround_radius_px(int v) { sbp_surround_ = clamp_i(v, 5, 30); }
+    // jAER clips center to [0, surround-1] and surround to >= center+1 so a
+    // surround ring always exists; a degenerate surround <= center would
+    // splat nothing and the filter would pass every event.
+    void set_center_radius_px(int v) {
+        int c = clamp_i(v, 0, 10);
+        if (c >= sbp_surround_) c = sbp_surround_ - 1;
+        if (c != sbp_center_) {
+            sbp_center_ = c;
+            sbp_rebuild_offsets();
+        }
+    }
+    void set_surround_radius_px(int v) {
+        int s = clamp_i(v, 1, 30);
+        if (s < sbp_center_ + 1) s = sbp_center_ + 1;
+        if (s != sbp_surround_) {
+            sbp_surround_ = s;
+            sbp_rebuild_offsets();
+        }
+    }
     void set_dt_surround_us(int v) { sbp_dt_surround_us_ = clamp_i(v, 100, 1000000); }
     int center_radius_px() const { return sbp_center_; }
     int surround_radius_px() const { return sbp_surround_; }
     int dt_surround_us() const { return sbp_dt_surround_us_; }
+
+    // KNoise (✅ 移植自 dv-processing KNoiseFilter) -------------------------
+    void set_knoise_dt_us(int v) { knoise_dt_us_ = clamp_i(v, 100, 100000); }
+    int knoise_dt_us() const { return knoise_dt_us_; }
 
     int width() const { return width_; }
     int height() const { return height_; }
@@ -246,6 +281,7 @@ public:
         dwf_init();
         harm_reset_state();
         harm_recompute();
+        knoise_init();
     }
 
 private:
@@ -310,6 +346,7 @@ private:
             case Mode::Harmonic:    return harmonic_pass(e);
             case Mode::Repetitious: return repetitious_pass(e);
             case Mode::SpatialBP:   return spatialbp_pass(e);
+            case Mode::KNoise:      return knoise_pass(e);
         }
         return true; // unreachable
     }
@@ -367,7 +404,11 @@ private:
 
     bool refractory_pass(const Event& e) const {
         const Metavision::timestamp lt = last_any_[idx_of(e.x, e.y)];
-        if (lt == kSentinel || e.t < lt) return true;
+        if (lt == kSentinel) return true;
+        // 对齐 jAER RefractoryFilter：仅 dt > refractoryPeriod 放行。时间回退
+        // 事件（Evt3 NonMonotonicTimeHigh、文件 seek）dt <= 0，应被滤掉而非
+        // 放行（audit §一-1.3）。last_any_ 在 decide_and_update 中无条件更新，
+        // 因此回退后每像素只牺牲一个事件，不会锁死。
         return (e.t - lt) > thr(refractory_period_us_); // strict > refractory
     }
 
@@ -507,26 +548,90 @@ private:
 
     // Port of jAER SpatialBandpassFilter: maintain a dedicated surround
     // timestamp map; pass when (e.t - surroundTs[x][y]) > dt_surround_us,
-    // then splat e.t to the square surround ring on every event.
+    // then splat e.t to the surround ring on every event (pass or drop —
+    // jAER's writeSurround also runs unconditionally). The ring cells are a
+    // precomputed offset list (jAER computeOffsets), so the splat touches
+    // only ring cells instead of iterating the full (2sr+1)^2 square and
+    // branch-skipping the center.
     bool spatialbp_pass(const Event& e) {
         const std::size_t idx = idx_of(e.x, e.y);
         const Metavision::timestamp st = surround_ts_[idx];
         const bool pass = (st == kSentinel) ||
                           (e.t - st > thr(sbp_dt_surround_us_));
-        const int sr = sbp_surround_;
-        const int cr = sbp_center_;
-        for (int dy = -sr; dy <= sr; ++dy) {
-            const int ny = e.y + dy;
+        for (const auto& off : sbp_offsets_) {
+            const int nx = e.x + off[0];
+            if (nx < 0 || nx >= width_) continue;
+            const int ny = e.y + off[1];
             if (ny < 0 || ny >= height_) continue;
-            for (int dx = -sr; dx <= sr; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                // Skip the square center region; splat only the surround ring.
-                if (dx >= -cr && dx <= cr && dy >= -cr && dy <= cr) continue;
-                const int nx = e.x + dx;
-                if (nx < 0 || nx >= width_) continue;
-                surround_ts_[idx_of(nx, ny)] = e.t;
+            surround_ts_[idx_of(nx, ny)] = e.t;
+        }
+        return pass;
+    }
+
+    void sbp_rebuild_offsets() {
+        sbp_offsets_.clear();
+        for (int dy = -sbp_surround_; dy <= sbp_surround_; ++dy) {
+            for (int dx = -sbp_surround_; dx <= sbp_surround_; ++dx) {
+                if (dx >= -sbp_center_ && dx <= sbp_center_ &&
+                    dy >= -sbp_center_ && dy <= sbp_center_) {
+                    continue;  // center region is not surround
+                }
+                sbp_offsets_.push_back({static_cast<std::int16_t>(dx),
+                                        static_cast<std::int16_t>(dy)});
             }
         }
+    }
+
+    // ✅ 移植自 dv-processing KNoiseFilter (Khodamoradi & Kastner 2021,
+    // ref/dv-processing-master/include/dv-processing/noise/k_noise_filter.hpp).
+    // Memory-efficient BAF alternative: instead of a W×H per-pixel time
+    // surface, keep ONE cell per column (W cells) and ONE per row (H cells) —
+    // ~18 KB at 640×480. Each cell records the last event seen in that
+    // row/column: timestamp, polarity, and the "other address" (y for a
+    // column cell, x for a row cell). An event passes when ANY of the 6
+    // neighbour cells (columns x-1/x/x+1, rows y-1/y/y+1 — dv uses OR, not
+    // AND) supports it: (e.t - cell.ts) <= dt, polarity hard-matches, and
+    // the stored other-address lies within 1 px of the event's own
+    // coordinate along that axis. Cells are updated unconditionally AFTER
+    // the decision (dv updates them even for filtered-out events).
+    // Divergences from dv, both intentional:
+    //  - dv requires only (t - cell.ts) <= timeDelta; a negative diff (time
+    //    rewind, Evt3 NonMonotonicTimeHigh, file seek) would spuriously
+    //    support an event. We additionally require diff >= 0, matching the
+    //    BAF/STCF convention in this file.
+    //  - dv zero-initializes its cells, so OFF events near y=0/x=0 can
+    //    spuriously pass at stream start; we use kSentinel so a cell only
+    //    supports after a real event was recorded in it.
+    bool knoise_pass(const Event& e) {
+        const Metavision::timestamp dt = thr(knoise_dt_us_);
+        bool pass = false;
+        for (int dx = -1; dx <= 1 && !pass; ++dx) {
+            const int nx = e.x + dx;
+            if (nx < 0 || nx >= width_) continue;
+            const KNoiseCell& c = knoise_col_[static_cast<std::size_t>(nx)];
+            if (c.ts == kSentinel) continue;
+            const Metavision::timestamp diff = e.t - c.ts;
+            if (diff < 0 || diff > dt) continue;      // dv: <= timeDelta
+            if (c.pol != e.p) continue;               // polarity hard match
+            if (std::abs(static_cast<int>(c.other) - e.y) > 1) continue;
+            pass = true;
+        }
+        for (int dy = -1; dy <= 1 && !pass; ++dy) {
+            const int ny = e.y + dy;
+            if (ny < 0 || ny >= height_) continue;
+            const KNoiseCell& c = knoise_row_[static_cast<std::size_t>(ny)];
+            if (c.ts == kSentinel) continue;
+            const Metavision::timestamp diff = e.t - c.ts;
+            if (diff < 0 || diff > dt) continue;
+            if (c.pol != e.p) continue;
+            if (std::abs(static_cast<int>(c.other) - e.x) > 1) continue;
+            pass = true;
+        }
+        // Unconditional update after the decision (dv retain()).
+        knoise_col_[static_cast<std::size_t>(e.x)] =
+            KNoiseCell{e.t, static_cast<std::int16_t>(e.y), e.p};
+        knoise_row_[static_cast<std::size_t>(e.y)] =
+            KNoiseCell{e.t, static_cast<std::int16_t>(e.x), e.p};
         return pass;
     }
 
@@ -586,6 +691,10 @@ private:
     };
 
     void dwf_init() {
+        // 注释定档（audit §一-1.3，有意不改实现）：jAER 的单窗（FWF）模式用
+        // 完整 windowLength，且所有事件（含被滤的）都入窗；本实现两种模式的
+        // 环容量都取 wlen/2，且单窗模式下被滤事件不入窗。单窗模式（非默认）
+        // 因此比 jAER 弱；double 模式（默认）不受影响。
         const int dwlen = dwf_wlen_ > 1 ? dwf_wlen_ / 2 : 1;
         const std::size_t c = static_cast<std::size_t>(dwlen);
         dwf_signal_.init(c);
@@ -594,7 +703,13 @@ private:
 
     // Harmonic (jAER HarmonicFilter) oscillator helpers -------------------
     void harm_recompute() {
-        const double f0 = static_cast<double>(harm_line_freq_hz_);
+        // jAER: "set by user to double line frequency" — mains-driven lamps
+        // flicker at 2x line (full-wave rectification / power ~ V^2), and the
+        // ON and OFF activity bursts alternate at that doubled rate; the
+        // oscillator crosses zero at those activity peaks only when resonant
+        // there. The GUI stores the LINE frequency (50/60); the resonance is
+        // doubled here.
+        const double f0 = 2.0 * static_cast<double>(harm_line_freq_hz_);
         constexpr double kTwoPi = 6.28318530717958647693;
         const double omega = (f0 > 0.0) ? kTwoPi * f0 : 1.0;
         const double tau = (f0 > 0.0) ? 1.0 / omega : 1.0;
@@ -657,24 +772,47 @@ private:
     int stcf_min_neighbors_{2};
     bool stcf_require_polarity_match_{true};
     bool stcf_allow_coincidence_{true}; // jAER: no coincidence exclusion
-    Metavision::timestamp refractory_period_us_{1000};
-    int dwf_wlen_{512};           // jAER wLen (total window length, events)
+    // jAER reuses the base-class 25 ms correlationTimeS as the refractory
+    // period; 10 ms keeps the same order (pixel-physical refractory is far
+    // shorter) while dropping less real signal at this sensor's rates.
+    Metavision::timestamp refractory_period_us_{10000};
+    int dwf_wlen_{64};           // jAER wLen (total window length, events);
+                                 // 512 (jAER pref default) costs an O(wLen)
+                                 // scan per noise event (~474 ns at 512) and
+                                 // saturates the SDK callback thread on this
+                                 // sensor's event rates — 64 keeps meaningful
+                                 // history at ~the STCF default's per-event cost
     int dwf_dis_thr_{5};          // jAER disThr (L1 distance threshold)
     int dwf_min_corr_{1};         // jAER numMustBeCorrelated
     bool dwf_double_mode_{true};  // jAER useDoubleMode
     Metavision::timestamp agep_tau_us_{10000};
     double agep_threshold_{5.0};  // jAER correlationThreshold (default 5, max 8)
     int agep_radius_{1};          // neighbourhood radius (1 = 3x3)
-    int harm_line_freq_hz_{50};   // jAER f0 默认 100（此处 50 = 市电频率，有意）
+    int harm_line_freq_hz_{50};   // 市电线频率（50/60）；振荡器共振频率在其
+                                  // 2 倍处（jAER "double line frequency"，见
+                                  // harm_recompute——倍频整流/V² 使灯光以 2×
+                                  // 线频闪烁，ON/OFF 活动峰也以 2× 线频交替）
     double harm_notch_q_{3.0};    // jAER quality factor Q
     double harm_threshold_{0.1};  // jAER threshold (fraction of power)
     int rep_ratio_shorter_{2};   // jAER RepetitiousFilter default
     int rep_ratio_longer_{2};    // jAER RepetitiousFilter default
     int rep_averaging_samples_{3}; // jAER averagingSamples default
     int rep_min_dt_to_store_{1000};  // jAER minDtToStore default (us)
-    int sbp_center_{2};
-    int sbp_surround_{10};
+    int sbp_center_{0};          // jAER centerRadius default
+    int sbp_surround_{1};        // jAER surroundRadius default. The previous
+                                 // defaults (center 2 / surround 10) splatted
+                                 // 416 cells per event — 52x jAER's 8 — and
+                                 // capped the filter at ~2.4 Mev/s/core.
     Metavision::timestamp sbp_dt_surround_us_{8000}; // jAER dtSurround default
+    /// Precomputed surround-ring splat offsets (jAER computeOffsets): only
+    /// the ring cells, so the per-event loop skips no center cells and runs
+    /// no center-membership branches.
+    std::vector<std::array<std::int16_t, 2>> sbp_offsets_;
+    // dv default is 2000 us (tuned on DAVIS240) — aligned by decision.
+    // For reference, the keep-rate measured on algo/tests/sparklers.raw is
+    // nearly flat in dt (0.718@500us .. 0.722@5ms), so the alignment costs
+    // nothing there.
+    Metavision::timestamp knoise_dt_us_{2000}; // dv KNoiseFilter timeDelta
 
     bool filter_hot_pixels_{false};
     bool adaptive_correlation_time_{false};
@@ -692,6 +830,22 @@ private:
     // DWF state (jAER DoubleWindowFilter) ---------------------------------
     DwRing dwf_signal_;
     DwRing dwf_noise_;
+
+    // KNoise state (dv-processing KNoiseFilter) ----------------------------
+    /// dv KMemCell: one cell per column (other = last y) and per row
+    /// (other = last x). ~16 B/cell → (W+H) cells ≈ 18 KB at 640×480.
+    struct KNoiseCell {
+        Metavision::timestamp ts{kSentinel};
+        std::int16_t other{-1};
+        short pol{0};
+    };
+    std::vector<KNoiseCell> knoise_col_; ///< width cells
+    std::vector<KNoiseCell> knoise_row_; ///< height cells
+
+    void knoise_init() {
+        knoise_col_.assign(static_cast<std::size_t>(width_), KNoiseCell{});
+        knoise_row_.assign(static_cast<std::size_t>(height_), KNoiseCell{});
+    }
 
     // Harmonic oscillator state (jAER HarmonicFilter) ---------------------
     float harm_x_{0.0f};          // oscillator position

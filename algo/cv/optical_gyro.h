@@ -11,6 +11,7 @@
 #define GUI_ALGO_CV_OPTICAL_GYRO_H
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -125,6 +126,8 @@ private:
         float birth_y{0.0F};
         float x{0.0F};
         float y{0.0F};
+        float vx{0.0F};
+        float vy{0.0F};
         float mass{0.0F};
         Metavision::timestamp birth_t{0};
         Metavision::timestamp last_t{0};
@@ -156,9 +159,38 @@ private:
         } else {
             GyroCluster& c = clusters_[best];
             const float a = location_mixing_factor_;
+            // Per-event velocity: IIR-smoothed position increment per second
+            // (jAER Cluster computes velocity from the same IIR position;
+            // the velocity drives the gainVelocity feed-forward term in
+            // transformEvent, OpticalGyro.java:120-131).
+            if (e.t > c.last_t && c.last_t > 0) {
+                const float dt_s = static_cast<float>(e.t - c.last_t) * 1e-6F;
+                if (dt_s > 0.0F) {
+                    const float ivx = (static_cast<float>(e.x) - c.x) / dt_s;
+                    const float ivy = (static_cast<float>(e.y) - c.y) / dt_s;
+                    const float v_alpha = std::min(1.0F, dt_s / 0.05F);  // 50ms tau
+                    c.vx += v_alpha * (ivx - c.vx);
+                    c.vy += v_alpha * (ivy - c.vy);
+                }
+            }
             c.x = c.x * (1.0F - a) + static_cast<float>(e.x) * a;
             c.y = c.y * (1.0F - a) + static_cast<float>(e.y) * a;
-            c.mass += 1.0F;
+            // jAER Cluster.updateMass (RectangularClusterTracker): the
+            // STORED mass decays per event and then the event adds 1, so
+            // the steady-state mass is rate × tau (bounded). The original
+            // port only decayed on READ (mass_now), letting the stored mass
+            // grow to the cumulative event count — the age feed-forward
+            // below then multiplies a huge mass by the cluster age and the
+            // int conversion overflows (UB on x86: INT_MIN), throwing the
+            // whole stabilized frame onto one border.
+            if (e.t > c.last_t) {
+                // jAER updateMass: decay the stored mass across the gap,
+                // then add 1. Simultaneous events (dt == 0) leave the mass
+                // untouched, matching jAER and the ObjectTracker guard.
+                c.mass *= std::exp(-static_cast<float>(e.t - c.last_t) /
+                                   static_cast<float>(mass_decay_tau_us_));
+                c.mass += 1.0F;
+            }
             c.last_t = e.t;
         }
     }
@@ -196,6 +228,8 @@ private:
         // Accumulate mass-weighted translation + small-angle rotation LS.
         float weight_sum = 0.0F;
         float avgxloc = 0.0F, avgyloc = 0.0F;
+        float avgxv = 0.0F, avgyv = 0.0F;
+        double age_sum = 0.0;
         // SmallAngleTransformFinder accumulators (w=1 per cluster, as in jAER).
         double qy2 = 0.0, qx2 = 0.0, qy = 0.0, qx = 0.0;
         double px = 0.0, py = 0.0, pxqy = 0.0, pyqx = 0.0;
@@ -217,6 +251,10 @@ private:
             // 不存在位移的速度外推——此前的自研外推已删除（§二-2.1）。
             avgxloc += (c.x - c.birth_x) * w;
             avgyloc += (c.y - c.birth_y) * w;
+            // jAER velocityPPt: mass-weighted mean cluster velocity.
+            avgxv += c.vx * w;
+            avgyv += c.vy * w;
+            age_sum += static_cast<double>(t - c.birth_t) * w;
             // Small-angle LS accumulators (centered on sensor midpoint).
             const double ppx = static_cast<double>(c.birth_x - sx2_);
             const double ppy = static_cast<double>(c.birth_y - sy2_);
@@ -239,6 +277,19 @@ private:
         // present→birth, matching jAER filterTransform(-avgxloc, ...)).
         avgxloc /= weight_sum;
         avgyloc /= weight_sum;
+        // jAER: averageClusterAge = ageSum/weightSum (weighted mean cluster
+        // age); velocityPPt = weighted mean velocity.
+        // Saturate instead of trusting upstream boundedness: the age feeds
+        // a position offset, so a runaway value would shove every event off
+        // frame (clamped to the border) rather than crash. The ceiling is
+        // INT_MAX -- average_cluster_age_ is an int, and anything larger
+        // would itself be a double->int overflow (the very UB this guard
+        // exists to prevent).
+        average_cluster_age_ = static_cast<int>(std::clamp(
+            age_sum / static_cast<double>(weight_sum), 0.0,
+            static_cast<double>(std::numeric_limits<int>::max())));
+        vel_pp_x_ = avgxv / weight_sum;
+        vel_pp_y_ = avgyv / weight_sum;
         float inst_tx = -avgxloc;
         float inst_ty = -avgyloc;
         float inst_rot = 0.0F;
@@ -293,14 +344,23 @@ private:
         const float sa = std::sin(rot_for_transform_ * strength_);
         const float tx = trans_x_filt_ * strength_;
         const float ty = trans_y_filt_ * strength_;
+        // jAER gainVelocity feed-forward (OpticalGyro.transformEvent):
+        // time * velocityPPt * gainVelocity — the velocity term cancels the
+        // low-pass lag on fast motion. gainVelocity = strength_.
+        // UNIT FIX (2026-08-23): jAER's velocityPPt is px/us and time is us
+        // (px/us * us = px). Our vel_pp_ is px/s, so the feed-forward was
+        // ~1e6x too large — events were thrown off-frame and clamped to the
+        // border, wiping out the main display. Convert px/s -> px/us.
+        const float vtx = static_cast<float>(average_cluster_age_) * vel_pp_x_ * 1e-6f * strength_;
+        const float vty = static_cast<float>(average_cluster_age_) * vel_pp_y_ * 1e-6f * strength_;
         const float xmax = static_cast<float>(width_ - 1);
         const float ymax = static_cast<float>(height_ - 1);
         for (Event& e : packet) {
             if (e.x >= width_ || e.y >= height_) continue;
             const float x = static_cast<float>(e.x) - sx2_;
             const float y = static_cast<float>(e.y) - sy2_;
-            float rx = ca * x - sa * y + tx + sx2_;
-            float ry = sa * x + ca * y + ty + sy2_;
+            float rx = ca * x - sa * y + tx + vtx + sx2_;
+            float ry = sa * x + ca * y + ty + vty + sy2_;
             if (rx < 0.0f) rx = 0.0f;
             else if (rx > xmax) rx = xmax;
             if (ry < 0.0f) ry = 0.0f;
@@ -341,6 +401,12 @@ private:
     // Holds the OLD rotationAngle (before the current filterTransform update),
     // since jAER computes cosAngle/sinAngle BEFORE updating rotationAngle.
     float rot_for_transform_{0.0F};
+    // jAER gainVelocity feed-forward state (OpticalGyro.transformEvent):
+    // velocityPPt (mass-weighted mean cluster velocity) and the weighted
+    // average cluster age — the velocity term cancels the low-pass lag.
+    float vel_pp_x_{0.0F};
+    float vel_pp_y_{0.0F};
+    int average_cluster_age_{0};
     Metavision::timestamp last_filter_t_{0};
 
     // Cluster tracker parameters — 自研默认值，与 jAER RectangularClusterTracker

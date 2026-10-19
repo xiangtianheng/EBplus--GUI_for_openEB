@@ -6,8 +6,10 @@
 // The bridge真正实例化并调用 algo/cv 与 algo/analytics 的真实算法类。
 // AlgoInstance 持有一个 AlgoBackend，push_events 时零拷贝 reinterpret_cast
 // EventCD→gui_algo::Event 后调用真实 process()/filter()，pull_result 返回
-// 过滤事件 + 叠加层 + 帧。注册表列出 28 个自研模块 + 8 个 OpenEB 事件变换
-// 阶段（flip/rotate/ROI 等，实际处理在 FilterChain，此处仅作注册占位）。
+// 过滤事件 + 叠加层 + 帧。注册表列出 28 个自研模块 + 4 个 OpenEB 事件变换
+// 阶段（flip/polarity 等，实际处理在 FilterChain，此处仅作注册占位；
+// rotate/transpose/rescale 已于 2026-08-18 移除——坐标变换不传播帧几何，
+// 会越界写坏下游 W×H 缓冲）。
 
 #ifndef GUI_ALGO_BRIDGE_ALGO_BRIDGE_H
 #define GUI_ALGO_BRIDGE_ALGO_BRIDGE_H
@@ -17,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +74,20 @@ struct AlgoInfo {
     /// limitations such as "requires an external trigger source"). Empty =
     /// no tooltip. Kept last so aggregate initialisers are unaffected.
     std::string description;
+    /// Whether the algorithm's user-visible output honours the global
+    /// Algorithm ROI. False when the visible output bypasses the backend
+    /// ROI path (xyt_visualizer: SpaceTimeDisplay is fed raw events in
+    /// MainWindow, so its backend's RoiFilter only affects the status
+    /// text). The main display hides the ROI frame while such an
+    /// algorithm is active — drawing it would falsely imply the output is
+    /// ROI-cropped. Kept last (with default) so aggregate initialisers
+    /// are unaffected.
+    bool uses_algo_roi{true};
+    /// Learning-window algorithms (e.g. Background Mask) must restart their
+    /// learning session when re-enabled — their frozen state is meaningless
+    /// after the gap. Kept last (with default) so aggregate initialisers are
+    /// unaffected.
+    bool reset_on_reenable{false};
 };
 
 /// A live algorithm instance. Holds a real AlgoBackend that wraps an algo/ class.
@@ -125,6 +142,12 @@ public:
     /// Pull the latest result (filtered events + overlay + frame).
     AlgoResult pull_result();
 
+    /// @brief Forwards the backend's per-batch output span (P6-A) —
+    /// {nullptr, 0} for pass-through/annotating algorithms. The caller
+    /// (live conditioned listener) substitutes the display/recorded span
+    /// with it when non-null. Valid until the next push_events.
+    std::pair<const Metavision::EventCD*, std::size_t> output_span();
+
     /// Dispatches the already-pulled @p result to this instance's display
     /// strategy (selected at construction from info().display_mode). The
     /// caller fills @p ctx with its display members; apply_strategy() then
@@ -140,10 +163,24 @@ public:
     /// dimensions than the instance was originally created with.
     void set_sensor_dimensions(int width, int height);
 
+    /// @brief Applies the unified ROI (Phase 2.6): the source-level crop the
+    /// camera/file playback applies. From the algorithm's perspective the ROI
+    /// window IS the effective sensor — the backend is resized to the ROI
+    /// dimensions (reusing the §五-D1 set_sensor_dimensions path), and
+    /// push_events() drops events outside the rect and shifts the survivors
+    /// to ROI-relative coordinates. Disabled = back to creation dimensions
+    /// and pass-through. Called by AlgoBridge::set_unified_roi_state.
+    void set_unified_roi(bool enabled, int x0, int y0, int x1, int y1);
+
 private:
     AlgoInfo info_;
     int width_;
     int height_;
+    /// "Natural" full-sensor dims: set at creation, updated by
+    /// set_sensor_dimensions (source switch). Restored into width_/height_
+    /// when the unified ROI is disabled.
+    int create_w_;
+    int create_h_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::string> param_values_;
     std::unique_ptr<AlgoBackend> backend_;
@@ -164,16 +201,26 @@ private:
     // full or (once disabled) counted in total_dropped_.
     //
     // Threshold rationale: typical file playback runs at ~1-2 Mev/s and
-    // normal live scenes at <10 Mev/s; only pathological bursts (bright
-    // flicker, sensor noise storms) sustain tens of Mev/s, which no
-    // per-event algorithm in this GUI can process in real time anyway.
+    // normal live scenes at <10 Mev/s. NOTE the guard measures the RAW
+    // full-sensor rate (before the backend's ROI/preproc), and pointing the
+    // camera at the calibration/focus blinking pattern is a LEGITIMATE scene
+    // that sustains ~20-40 Mev/s full-sensor — 30 Mev/s was too low and
+    // auto-disabled E2VID within seconds in exactly that scenario (regression
+    // vs. main). 100 Mev/s keeps headroom for legitimate blinking-target use
+    // while still catching true runaway storms.
     bool overloaded_{false};
     int flood_strikes_{0};
     std::size_t rate_window_events_{0};
     std::chrono::steady_clock::time_point rate_window_start_{};
-    static constexpr double kMaxEventRateEvPerSec = 30e6;  // 30 Mev/s
+    static constexpr double kMaxEventRateEvPerSec = 100e6;  // 100 Mev/s
     static constexpr int kFloodStrikes = 4;
     std::function<void()> overload_callback_;
+
+    // Unified ROI state (Phase 2.6). The crop+shift itself moved to the
+    // shared StreamConditioner; this state only drives the backend RESIZE
+    // (set_unified_roi) so backend dims match the ROI-relative stream.
+    bool uroi_enabled_{false};
+    int uroi_x0_{0}, uroi_y0_{0}, uroi_x1_{0}, uroi_y1_{0};
 
     // --- Drop-rate telemetry (design §5.6.7) ----------------------------
     // total_pushed_ = events received via push_events (the denominator).
@@ -208,6 +255,23 @@ public:
     /// parameters that were set before the instance was enabled.
     std::shared_ptr<AlgoInstance> find_or_create(const std::string& name);
 
+    /// @brief Creates/registers a live instance from an explicit AlgoInfo,
+    /// bypassing the registry. Used by non-algorithm workflows
+    /// (sensor_self_test from the Devices panel button) that are not
+    /// registered algorithms but still need a backend instance.
+    std::shared_ptr<AlgoInstance> create_with_info(const AlgoInfo& info);
+    std::shared_ptr<AlgoInstance> find_or_create_with_info(const AlgoInfo& info);
+
+    /// @brief Applies the unified ROI state (Phase 2.6) to every live
+    /// instance and caches it so instances created later inherit it. From
+    /// the algorithm's perspective the ROI window is the effective sensor
+    /// (see AlgoInstance::set_unified_roi). In RONI mode (Phase 2.6 debug
+    /// D-5) the source already drops inside-rect events at ABSOLUTE
+    /// coordinates, so instances stay pass-through at full dimensions
+    /// (no crop, no translate, no resize).
+    void set_unified_roi_state(bool enabled, int x0, int y0, int x1, int y1,
+                               bool roni = false);
+
     /// @brief Sets the actual sensor dimensions so new instances are created
     /// with the correct width/height instead of the 1280x720 default.
     void set_sensor_dimensions(int width, int height);
@@ -219,12 +283,8 @@ public:
     /// selector so a single control updates all enabled algorithms.
     void apply_global_preproc(const std::string& key, const std::string& value);
 
-    /// @brief Applies shared ROI parameters (roi_*) to every live
-    /// self-developed instance and caches them so future instances
-    /// created via create() inherit the current ROI settings (N3).
-    void apply_global_roi(const std::string& enabled, const std::string& x,
-                          const std::string& y, const std::string& w,
-                          const std::string& h);
+    // Phase 2.6: apply_global_roi + roi_cache_ deleted (legacy per-backend
+    // ROI). The unified ROI is driven via AlgorithmsPanel::unified_roi_changed.
 
     /// @brief Caches per-algorithm parameters for an instance that is not
     /// yet live. The cached values are replayed in create() so that
@@ -232,6 +292,15 @@ public:
     /// algorithm is later enabled (N1).
     void cache_algo_params(const std::string& name,
                            const std::map<std::string, std::string>& params);
+
+    /// @brief Reads a cached parameter for an algorithm with no live
+    /// instance (the N1 cache above). Returns std::nullopt when neither
+    /// the algorithm nor the key is cached — distinct from a cached empty
+    /// string, which is a meaningful value (e.g. a cleared model_path).
+    /// Used by AlgorithmsPanel to refresh its controls after a config load
+    /// (audit §5.9-疑点4).
+    std::optional<std::string> get_cached_algo_param(
+        const std::string& name, const std::string& key) const;
 
     /// @brief Looks up a live instance by name. Returns nullptr if no live
     /// instance exists (either never created or already destroyed).
@@ -266,11 +335,6 @@ private:
     /// (ConfigManager, calibration wizard).
     std::unordered_map<std::string, std::string> preproc_cache_;
 
-    /// Cache of the latest global roi_* parameter values (N3). Replayed
-    /// in create() alongside preproc_cache_ so new instances inherit the
-    /// current ROI settings.
-    std::unordered_map<std::string, std::string> roi_cache_;
-
     /// Per-algorithm parameter cache for instances not yet live (N1).
     /// Populated by ConfigManager::apply_algo_state when an algorithm has
     /// no live instance; replayed in create() so saved values are not lost.
@@ -279,6 +343,14 @@ private:
     /// Flood-guard overload callback, wired into every instance created by
     /// create() (see set_overload_callback).
     std::function<void(const std::string& name)> overload_cb_;
+
+    /// Cached unified ROI state (Phase 2.6). Replayed in create_with_info()
+    /// so instances created later inherit the active ROI window. uroi_roni_
+    /// (Phase 2.6 debug D-5): RONI = instances stay pass-through at full
+    /// dims (source-filtered absolute coordinates).
+    bool uroi_enabled_{false};
+    bool uroi_roni_{false};
+    int uroi_x0_{0}, uroi_y0_{0}, uroi_x1_{0}, uroi_y1_{0};
 };
 
 } // namespace gui

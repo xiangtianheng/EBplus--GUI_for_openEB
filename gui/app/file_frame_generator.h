@@ -28,6 +28,8 @@
 #include <QTimer>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -35,16 +37,31 @@
 #include <opencv2/core.hpp>
 
 #include <metavision/sdk/base/utils/timestamp.h>
+
+#include "algo_bridge/filter_chain.h"
+#include "app/stream_conditioner.h"
 #include <metavision/sdk/base/events/event_cd.h>
 #include <metavision/sdk/core/utils/colors.h>
 
 namespace gui {
 
 class FilterChain;  ///< Forward decl — applied at render time for file mode.
+class FrameModeRenderer;  ///< Forward decl — non-integration display frame modes.
 
 class FileFrameGenerator : public QObject {
     Q_OBJECT
 public:
+    /// @brief Per-window algorithm feed hook (P6-A file-mode write-back).
+    /// Called synchronously inside render_frame() AFTER the window events are
+    /// conditioned and emitted to events_window_ready. When the callback
+    /// returns a non-null span (a stream-filter algorithm's per-batch output,
+    /// e.g. hot_pixel_filter / EIS), the rendered frame is REPAINTED from
+    /// those events instead of the conditioned window — so in-place filtering
+    /// is visible during file playback, matching the live-mode behaviour.
+    /// The span must remain valid until the callback returns.
+    void set_algo_feed_callback(
+        std::function<std::pair<const Metavision::EventCD*, std::size_t>()> cb);
+
     explicit FileFrameGenerator(QObject* parent = nullptr);
     ~FileFrameGenerator();
 
@@ -78,12 +95,22 @@ public:
     /// @brief Sets the color palette for rendering (matches CDFrameGenerator).
     void set_color_palette(Metavision::ColorPalette palette);
 
-    /// @brief Sets the FilterChain for event transformation (flip, rotate,
+    /// @brief Sets the FilterChain for event transformation (flip, polarity,
     /// etc.) during file playback. Applied per-frame in render_frame() to
     /// BOTH the display rendering and the events emitted via
-    /// events_window_ready, so that flip/rotate/etc. take effect immediately
+    /// events_window_ready, so that transforms take effect immediately
     /// and algorithm output is also transformed. nullptr = no filtering.
-    void set_filter_chain(FilterChain* fc) { filter_chain_ = fc; }
+    void set_filter_chain(FilterChain* fc) {
+        filter_chain_ = fc;
+        conditioner_.set_filter_chain(fc);
+    }
+
+    /// @brief Sets the shared frame-mode renderer (non-integration display
+    /// modes). render_frame() feeds each window's (filtered) events to it and
+    /// uses its generated frame for display. nullptr keeps the palette render.
+    void set_frame_mode_renderer(FrameModeRenderer* renderer) {
+        frame_mode_renderer_ = renderer;
+    }
 
     // --- Playback control (GUI thread only) ---
 
@@ -162,7 +189,7 @@ signals:
     /// @brief Emitted with the (filtered) events in the current accumulation
     /// window [start, end). Used to feed algorithm instances synchronously
     /// with the displayed frame during file playback. When a FilterChain is
-    /// set, the events are already filtered (flip/rotate/etc. applied) so
+    /// set, the events are already filtered (flip/etc. applied) so
     /// algorithm output matches the display orientation.
     void events_window_ready(std::shared_ptr<std::vector<Metavision::EventCD>> events,
                              Metavision::timestamp ts);
@@ -172,12 +199,15 @@ signals:
     /// streaming thread (queued to listeners on the GUI thread).
     void buffer_truncated();
 
+    /// @brief Per-window algorithm feed hook (P6-A file-mode write-back).
+    /// Called synchronously inside render_frame() AFTER the window events are
 private:
     void on_timer();
     void render_frame(Metavision::timestamp start_us, Metavision::timestamp end_us);
 
     // Event buffer — appended from SDK thread, read from GUI thread.
     std::vector<Metavision::EventCD> events_;
+    std::function<std::pair<const Metavision::EventCD*, std::size_t>()> algo_feed_cb_;
     mutable std::mutex mutex_;
     // OOM guard state (audit §六-C2), guarded by mutex_.
     bool truncated_{false};
@@ -209,6 +239,64 @@ private:
     // rendered pixels and the events emitted via events_window_ready, so
     // algorithm output matches the display orientation.
     FilterChain* filter_chain_{nullptr};
+
+    // Frame-mode rendering (non-integration modes). Shared with FramePipeline;
+    // render_frame feeds each window's filtered events and uses the generated
+    // frame for display when the renderer is active.
+    FrameModeRenderer* frame_mode_renderer_{nullptr};
+
+    // Shared conditioning (Phase 2.5 rework 2026-08-19): applied ONCE per
+    // rendered window in render_frame(). The SAME output feeds the rendered
+    // pixels AND events_window_ready — algorithm instances no longer re-run
+    // the noise filter per instance (the old display-only display_preproc_
+    // plus per-backend Preprocessors collapsed into this one pass).
+    // GUI thread only (render_frame runs there).
+    StreamConditioner conditioner_;
+
+    // Software ROI (Phase 2.6). The resolved rect feeds conditioner_ (which
+    // crops+shifts); roi_roni_ (Phase 2.6 debug D-5) inverts the predicate:
+    // RONI keeps events OUTSIDE the rect with absolute coordinates.
+    bool roi_enabled_{false};
+    bool roi_roni_{false};
+    int roi_x_{-1}, roi_y_{-1}, roi_w_{0}, roi_h_{0};
+    int roi_x0_{0}, roi_y0_{0}, roi_x1_{0}, roi_y1_{0};
+
+    // Display placement: origin added back to the conditioned ROI-relative
+    // events for RENDERING only (full-sensor frame, pre-rework visuals).
+    // Set by set_display_roi / FramePipeline::set_display_roi_origin.
+    bool render_origin_active_{false};
+    int render_origin_x_{0};
+    int render_origin_y_{0};
+    std::vector<Metavision::EventCD> render_shift_buf_;
+public:
+    /// @brief Applies a conditioning parameter (preproc_* keys).
+    void set_conditioner_param(const std::string& key, const std::string& value) {
+        conditioner_.set_param(key, value);
+    }
+    /// @brief Clears the conditioner's temporal state (seek/loop).
+    void reset_conditioner() { conditioner_.reset_temporal(); }
+    /// @brief Display-side ROI origin (rendering only; canonical emitted
+    /// stream stays ROI-relative).
+    void set_render_origin(bool active, int x, int y) {
+        render_origin_active_ = active;
+        render_origin_x_ = x;
+        render_origin_y_ = y;
+    }
+
+    /// @brief Sets the file-mode software ROI (Phase 2.6). Events outside the
+    /// rect are dropped from BOTH the rendered frame and events_window_ready
+    /// (same "source only outputs ROI events" semantics as the hardware ROI).
+    /// @p x/@p y = -1 = auto-center on the sensor; w/h <= 0 = full sensor.
+    /// @p roni = true inverts the semantics (keep outside, drop inside).
+    void set_display_roi(bool enabled, int x, int y, int w, int h, bool roni = false);
+    /// @brief Reads the software ROI state (computed rect [x0,x1) × [y0,y1)).
+    void display_roi(bool& enabled, int& x0, int& y0, int& x1, int& y1) const {
+        enabled = roi_enabled_;
+        x0 = roi_x0_; y0 = roi_y0_; x1 = roi_x1_; y1 = roi_y1_;
+    }
+    /// @brief True when the software ROI is in RONI (keep-outside) mode.
+    bool display_roi_roni() const { return roi_roni_; }
+private:
 };
 
 } // namespace gui

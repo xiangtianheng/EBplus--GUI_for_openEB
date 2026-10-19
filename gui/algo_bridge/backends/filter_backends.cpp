@@ -1,5 +1,5 @@
 // gui/algo_bridge/backends/filter_backends.cpp — OrientationFilter, DirectionSelective,
-// BackgroundMask, BandpassFilter (design §3.4). Split from the former algo_backend.cpp monolith.
+// BackgroundMask (design §3.4). Split from the former algo_backend.cpp monolith.
 
 #include "algo_bridge/algo_backend.h"
 #include "algo_bridge/backends/backend_common.h"
@@ -11,7 +11,6 @@
 #include "algo/cv/orientation_filter.h"
 #include "algo/cv/direction_selective_filter.h"
 #include "algo/cv/background_mask_filter.h"
-#include "algo/cv/bandpass_filter.h"
 
 using namespace gui::backend_detail;
 
@@ -28,12 +27,12 @@ class OrientationFilterBackend final : public AlgoBackend {
     std::vector<Metavision::EventCD> passthrough_;
     RoiFilter roi_;
     std::vector<gui_algo::Event> roi_buf_;
+    std::vector<int> last_orientations_;  // per-event orientation labels
     // ROI-filtered events, cached so pull_result pairs orientation labels
-    // with the SAME subsequence they were classified on (audit §5-G2:
+    // with the SAME subsequence they were classified on (audit §五-G2:
     // previously paired with the unfiltered passthrough_ by index, so both
     // the pixel positions and the color labels were wrong).
     std::vector<Metavision::EventCD> filtered_;
-    std::vector<int> last_orientations_;  // per-event orientation labels
     // Decaying histogram (jAER uses a per-packet decay factor on the
     // orientation counters). A cumulative counter would grow without bound.
     float hist_[gui_algo::OrientationFilter::kNumOrientations]{};
@@ -125,7 +124,15 @@ public:
     void reset() override { algo_.reset(); passthrough_.clear(); roi_buf_.clear(); filtered_.clear(); last_orientations_.clear(); std::fill(hist_, hist_ + 4, 0.0F); }
     void set_sensor_dimensions(int w, int h) override {
         roi_.set_sensor_dimensions(w, h);
-        algo_ = gui_algo::OrientationFilter(w, h);  // sensor-sized SAE maps
+        const int mdt = algo_.min_dt_threshold_us();
+        const bool avg = algo_.use_average_dt();
+        const bool hist = algo_.ori_history_enabled();
+        const int rej = algo_.dt_reject_threshold_us();
+        algo_ = gui_algo::OrientationFilter(w, h);
+        algo_.set_min_dt_threshold_us(mdt);
+        algo_.set_use_average_dt(avg);
+        algo_.set_ori_history_enabled(hist);
+        algo_.set_dt_reject_threshold_us(rej);
     }
 };
 
@@ -133,15 +140,22 @@ public:
 /// Supports ROI (design §5.6.6): only ROI events feed the histogram.
 class DirectionSelectiveBackend final : public AlgoBackend {
     gui_algo::DirectionSelectiveFilter algo_;
+    // Embedded orientation pre-stage (jAER algorithm flow: rbodo
+    // DirectionSelectiveFlow instantiates a SimpleOrientationFilter as an
+    // enclosed filter and runs in = oriFilter.filterPacket(in) BEFORE the
+    // direction search — direction_selective only makes sense on
+    // orientation-typed input, so the backend performs the same chain
+    // internally instead of running the raw 8-neighbour degraded path).
+    gui_algo::OrientationFilter ori_algo_;
     std::vector<Metavision::EventCD> passthrough_;
     RoiFilter roi_;
     std::vector<gui_algo::Event> roi_buf_;
-    // ROI-filtered events, cached so pull_result pairs direction labels with
-    // the SAME subsequence they were classified on (audit §5-G2).
-    std::vector<Metavision::EventCD> filtered_;
     std::vector<int> last_dirs_;  // per-event direction labels
+    // ROI-filtered events, cached so pull_result pairs direction labels with
+    // the SAME subsequence they were classified on (audit §五-G2).
+    std::vector<Metavision::EventCD> filtered_;
 public:
-    DirectionSelectiveBackend(int w, int h) : algo_(w, h) {
+    DirectionSelectiveBackend(int w, int h) : algo_(w, h), ori_algo_(w, h) {
         roi_.init(w, h);
         algo_.set_enable_global_mode(true);
     }
@@ -152,6 +166,10 @@ public:
         else if (k == "search_distance") algo_.set_search_distance(to_i(v));
         else if (k == "tau_low_ms") algo_.set_tau_low_ms(to_i(v));
         else if (k == "enable_global_mode") algo_.set_enable_global_mode(to_b(v));
+        else if (k == "ori_min_dt_threshold_us")
+            ori_algo_.set_min_dt_threshold_us(to_i(v));
+        else if (k == "ori_dt_reject_threshold_us")
+            ori_algo_.set_dt_reject_threshold_us(to_i(v));
     }
     std::string get_param(const std::string& k) const override {
         auto r = roi_.get_param(k); if (!r.empty()) return r;
@@ -160,6 +178,10 @@ public:
         if (k == "search_distance") return from_i(algo_.search_distance());
         if (k == "tau_low_ms") return from_i(algo_.tau_low_ms());
         if (k == "enable_global_mode") return from_b(algo_.enable_global_mode());
+        if (k == "ori_min_dt_threshold_us")
+            return from_i(ori_algo_.min_dt_threshold_us());
+        if (k == "ori_dt_reject_threshold_us")
+            return from_i(ori_algo_.dt_reject_threshold_us());
         return {};
     }
     void push_events(const Metavision::EventCD* b, const Metavision::EventCD* e) override {
@@ -167,12 +189,16 @@ public:
         auto [ev, n] = roi_.apply(as_events(passthrough_.data()),
                                    passthrough_.size(), roi_buf_);
         // Cache the filtered subsequence so pull_result pairs labels with
-        // the same events (audit §5-G2).
+        // the same events (audit §五-G2).
         filtered_.assign(reinterpret_cast<const Metavision::EventCD*>(ev),
                          reinterpret_cast<const Metavision::EventCD*>(ev + n));
         last_dirs_.resize(n);
         for (std::size_t i = 0; i < n; ++i) {
-            last_dirs_[i] = algo_.classify(ev[i]);
+            // jAER chain: orientation label first (enclosed SimpleOrientationFilter),
+            // then the orientation-aware direction search on the typed event.
+            // An undetermined label (-1) falls back to the raw 8-neighbour path.
+            const int ori = ori_algo_.classify(ev[i]);
+            last_dirs_[i] = algo_.classify(ev[i], ori);
         }
     }
     AlgoResult pull_result() override {
@@ -244,13 +270,26 @@ public:
                    std::string(roi_.region.enabled ? " (ROI)" : "");
         return r;
     }
-    void reset() override { algo_.reset(); passthrough_.clear(); roi_buf_.clear(); filtered_.clear(); last_dirs_.clear(); }
+    void reset() override { algo_.reset(); ori_algo_.reset(); passthrough_.clear(); roi_buf_.clear(); filtered_.clear(); last_dirs_.clear(); }
     void set_sensor_dimensions(int w, int h) override {
         roi_.set_sensor_dimensions(w, h);
-        // Rebuild sensor-sized SAE maps; preserve the global-mode default the
-        // constructor establishes (other params revert to ctor defaults).
+        // Rebuild sensor-sized SAE maps; preserve the tuned params across the
+        // rebuild (the auto-ROI resize hits the live instance).
+        const int tau_us = algo_.time_window_us();
+        const int min_dt = algo_.min_dt_us();
+        const int sd = algo_.search_distance();
+        const int tlow = algo_.tau_low_ms();
+        const int ori_min_dt = ori_algo_.min_dt_threshold_us();
+        const int ori_reject = ori_algo_.dt_reject_threshold_us();
         algo_ = gui_algo::DirectionSelectiveFilter(w, h);
         algo_.set_enable_global_mode(true);
+        algo_.set_time_window_us(tau_us);
+        algo_.set_min_dt_us(min_dt);
+        algo_.set_search_distance(sd);
+        algo_.set_tau_low_ms(tlow);
+        ori_algo_ = gui_algo::OrientationFilter(w, h);
+        ori_algo_.set_min_dt_threshold_us(ori_min_dt);
+        ori_algo_.set_dt_reject_threshold_us(ori_reject);
     }
 };
 
@@ -267,8 +306,11 @@ public:
     void set_param(const std::string& k, const std::string& v) override {
         if (roi_.set_param(k, v)) return;
         // "learning_window_s" maps to the algo's learning window in seconds
-        // (set_learning_window_s) — it is a window, not a rate (§5-B2).
-        if (k == "learning_window_s") algo_.set_learning_window_s(static_cast<float>(to_d(v)));
+        // (set_learning_window_s) — it is a window, not a rate (§五-B2).
+        // "learning_rate" is accepted as a backward-compat alias for configs
+        // saved before the rename (§11.2-G); ConfigManager also migrates it.
+        if (k == "learning_window_s" || k == "learning_rate")
+            algo_.set_learning_window_s(static_cast<float>(to_d(v)));
         else if (k == "threshold") algo_.set_background_rate_threshold_hz(static_cast<float>(to_d(v)));
         else if (k == "erosion_size") algo_.set_erosion_size(to_i(v));
     }
@@ -290,7 +332,29 @@ public:
         AlgoResult r;
         r.filtered_events = passthrough_;
         r.has_frame = true;
-        r.frame = algo_.mask().clone();
+        cv::Mat frame = algo_.mask().clone();
+        if (algo_.collect()) {
+            // Still inside the learning window: the mask is all-zero by design
+            // (jAER leaves the bitmap null while collecting). Tell the user to
+            // hold still — the foreground mask appears once the window elapses.
+            cv::Mat bgr;
+            cv::cvtColor(frame, bgr, cv::COLOR_GRAY2BGR);
+            std::string msg = "Learning background, please keep the camera "
+                              "still (" +
+                              std::to_string(static_cast<int>(algo_.learning_window_s())) +
+                              " s)...";
+            int baseline = 0;
+            const double font_scale = 0.8;
+            const cv::Size ts = cv::getTextSize(msg, cv::FONT_HERSHEY_SIMPLEX,
+                                                font_scale, 2, &baseline);
+            const cv::Point org(std::max(10, (bgr.cols - ts.width) / 2),
+                                std::max(30, (bgr.rows + ts.height) / 2));
+            cv::putText(bgr, msg, org, cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(0, 255, 0), 2);
+            r.frame = bgr;
+        } else {
+            r.frame = frame;
+        }
         r.status = "bg_mask: active" +
                    std::string(roi_.region.enabled ? " (ROI)" : "");
         return r;
@@ -302,63 +366,6 @@ public:
     }
 };
 
-/// BandpassFilter backend — event-rate band-pass, text overlay.
-/// Supports ROI (design §5.6.6): rate computed from ROI events only.
-class BandpassFilterBackend final : public AlgoBackend {
-    gui_algo::BandpassFilter algo_;
-    std::vector<Metavision::EventCD> passthrough_;
-    RoiFilter roi_;
-    std::vector<gui_algo::Event> roi_buf_;
-    Metavision::timestamp last_t_{0};
-    double low_cutoff_hz_{1.0};
-    double high_cutoff_hz_{10.0};
-public:
-    BandpassFilterBackend(int w, int h) : algo_(1.0F, 10.0F, 1, 0.033) { roi_.init(w, h); }
-    void set_param(const std::string& k, const std::string& v) override {
-        if (roi_.set_param(k, v)) return;
-        if (k == "low_cutoff_hz") {
-            low_cutoff_hz_ = to_d(v);
-            algo_.set_cutoffs(low_cutoff_hz_, high_cutoff_hz_);
-        } else if (k == "high_cutoff_hz") {
-            high_cutoff_hz_ = to_d(v);
-            algo_.set_cutoffs(low_cutoff_hz_, high_cutoff_hz_);
-        }
-    }
-    std::string get_param(const std::string& k) const override {
-        auto r = roi_.get_param(k); if (!r.empty()) return r;
-        if (k == "low_cutoff_hz") return from_d(low_cutoff_hz_);
-        if (k == "high_cutoff_hz") return from_d(high_cutoff_hz_);
-        return {};
-    }
-    void push_events(const Metavision::EventCD* b, const Metavision::EventCD* e) override {
-        passthrough_.assign(b, e);
-        auto [ev, n] = roi_.apply(as_events(passthrough_.data()),
-                                   passthrough_.size(), roi_buf_);
-        if (!passthrough_.empty()) {
-            const auto t = passthrough_.back().t;
-            algo_.add_events(n, t);
-            last_t_ = t;
-        }
-    }
-    AlgoResult pull_result() override {
-        AlgoResult r;
-        r.filtered_events = passthrough_;
-        OverlayText t;
-        t.x = 10; t.y = 60;
-        t.text = "bp: " + std::to_string(algo_.value()) + " ev/s";
-        r.texts.push_back(t);
-        r.status = "bandpass: " + std::to_string(algo_.value()) + " ev/s" +
-                   std::string(roi_.region.enabled ? " (ROI)" : "");
-        return r;
-    }
-    void reset() override { algo_.reset(); passthrough_.clear(); roi_buf_.clear(); last_t_ = 0; }
-    void set_sensor_dimensions(int w, int h) override {
-        // The algo holds no sensor-sized state (rate filter) — only the ROI
-        // geometry needs updating (audit §5-D1).
-        roi_.set_sensor_dimensions(w, h);
-    }
-};
-
 
 // --- Per-category factory (called by create_algo_backend in backend_factory.cpp)
 std::unique_ptr<AlgoBackend> create_filter_backend(const std::string& name,
@@ -366,7 +373,6 @@ std::unique_ptr<AlgoBackend> create_filter_backend(const std::string& name,
     if (name == "orientation_filter")          return std::make_unique<OrientationFilterBackend>(width, height);
     if (name == "direction_selective")         return std::make_unique<DirectionSelectiveBackend>(width, height);
     if (name == "background_mask")             return std::make_unique<BackgroundMaskBackend>(width, height);
-    if (name == "bandpass_filter")             return std::make_unique<BandpassFilterBackend>(width, height);
     return nullptr;
 }
 

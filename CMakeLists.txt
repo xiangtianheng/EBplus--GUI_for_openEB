@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(GUI_for_openEB LANGUAGES CXX VERSION 1.9.0)
+project(GUI_for_openEB LANGUAGES CXX VERSION 3.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,7 +14,7 @@ option(GUI_FOR_OPENEB_BUILD_TESTS "Build algorithm unit tests" ON)
 
 # GCC 15+ no longer implicitly includes <cstdint>; add it globally so that
 # uint8_t / uint16_t etc. used throughout the OpenEB headers stay available.
-# See doc/compile.md for details.
+# See wiki/compile.md for details.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     add_compile_options("-include;cstdint")
 endif()

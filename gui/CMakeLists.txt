@@ -4,12 +4,18 @@
 # so the unit tests in tests/ can link the same code without recompiling it.
 set(GUI_LIB_SOURCES
     main_window.cpp
+    app/aedat4_file_source.cpp
+    app/alpdata_file_source.cpp
     app/camera_controller.cpp
+    app/external_file_source.cpp
     app/file_converter.cpp
     app/file_frame_generator.cpp
+    app/frame_mode_renderer.cpp
     app/frame_pipeline.cpp
     app/icon_provider.cpp
+    app/lz4_frame_decoder.cpp
     app/statistics_controller.cpp
+    app/stream_conditioner.cpp
     app/theme_controller.cpp
     algo_bridge/algo_bridge.cpp
     algo_bridge/backends/cv_backends.cpp
@@ -33,6 +39,9 @@ set(GUI_LIB_SOURCES
     panels/display_panel.cpp
     panels/esp_panel.cpp
     panels/file_tools_panel.cpp
+    panels/file_op_dialog.cpp
+    panels/file_info_dialog.cpp
+    recorder/record_dialog.cpp
     panels/information_panel.cpp
     panels/preprocessing_panel.cpp
     panels/roi_panel.cpp
@@ -42,16 +51,17 @@ set(GUI_LIB_SOURCES
     recorder/playback_controller.cpp
     recorder/playback_controls.cpp
     recorder/recorder_controller.cpp
+    recorder/aedat4_writer.cpp
 )
 
-# Phase 9 — calibration wizard + tools (built when sources are present).
+# Phase 9 / Phase 4 — calibration wizard + tools (built when sources are present).
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/calibration/calibration_wizard.cpp")
     list(APPEND GUI_LIB_SOURCES
         calibration/calibration_wizard.cpp
-        calibration/chessboard_display.cpp
+        calibration/blinking_chessboard_display.cpp
         calibration/calibration_event_tap.cpp
-        calibration/sharpness_dialog.cpp
-        calibration/sharpness_metrics.cpp
+        calibration/calibration_worker.cpp
+        calibration/focus_dialog.cpp
     )
 endif()
 
@@ -66,6 +76,9 @@ list(APPEND GUI_LIB_SOURCES
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/display/space_time_display.cpp")
     list(APPEND GUI_LIB_SOURCES
         widgets/algo_window.cpp
+        widgets/aps_window.cpp
+        widgets/imu_window.cpp
+        widgets/unified_roi_dialog.cpp
         display/frame_annotator.cpp
         display/space_time_display.cpp
     )
@@ -90,6 +103,28 @@ if(TARGET MetavisionSDK::hal)
     target_link_libraries(gui_core PUBLIC MetavisionSDK::hal)
 elseif(TARGET Metavision::HAL)
     target_link_libraries(gui_core PUBLIC Metavision::HAL)
+endif()
+
+# Live DAVIS (inivation) camera support — optional, based on libusb-1.0 only
+# (protocol ported from the dv-processing reference). Without libusb the
+# parser/bias sources still build (used by unit tests) but live connection
+# and the device layer are compiled out (GUI_HAVE_DAVIS=0).
+target_sources(gui_core PRIVATE
+    davis/davis_parser.cpp
+    davis/davis_biases.cpp
+    davis/dvxplorer_parser.cpp
+)
+find_path(LIBUSB_INCLUDE_DIR NAMES libusb.h PATH_SUFFIXES libusb-1.0)
+find_library(LIBUSB_LIBRARY NAMES usb-1.0)
+if(LIBUSB_INCLUDE_DIR AND LIBUSB_LIBRARY)
+    target_compile_definitions(gui_core PUBLIC GUI_HAVE_DAVIS=1)
+    target_include_directories(gui_core PUBLIC ${LIBUSB_INCLUDE_DIR})
+    target_link_libraries(gui_core PUBLIC ${LIBUSB_LIBRARY})
+    target_sources(gui_core PRIVATE davis/davis_device.cpp davis/dvxplorer_device.cpp)
+    message(STATUS "inivation live camera support (DAVIS/DVXplorer): enabled")
+else()
+    target_compile_definitions(gui_core PUBLIC GUI_HAVE_DAVIS=0)
+    message(STATUS "inivation live camera support: disabled (libusb-1.0 development files not found)")
 endif()
 
 # Main executable — entry point only; all logic lives in gui_core.

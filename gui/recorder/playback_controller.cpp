@@ -2,6 +2,9 @@
 
 #include "playback_controller.h"
 
+#include <chrono>
+#include <thread>
+
 #include <metavision/sdk/stream/camera.h>
 #include <metavision/sdk/stream/camera_exception.h>
 #include <metavision/sdk/stream/offline_streaming_control.h>
@@ -101,19 +104,35 @@ bool PlaybackController::open_file(const QString& path) {
     // the new file loaded but never playing — audit §六-P1).
     playing_ = false;
     at_eof_ = false;
+    // §12.2-A #1 / §11.4-P0-1(b): set loop mode BEFORE start() so the
+    // FileFrameGenerator is configured correctly before any events arrive.
+    // Previously set_file_loop was called after start(), creating a window
+    // where on_timer could fire with stale loop_ and hit the wrong EOF/loop
+    // branch — for short files that triggered runtime_error during start(),
+    // the EOF callback set loading_complete_ before loop mode was applied,
+    // causing loop files to stop instead of wrap.
+    if (auto* fp = controller_->frame_pipeline()) {
+        fp->set_file_loop(loop_);
+    }
     // Start the camera so events flow into the FileFrameGenerator buffer.
     // With real_time_playback=false, all events arrive in ~10ms regardless
     // of file duration.
     if (!controller_->start()) {
         return false;
     }
-    // Query duration from OSC (ready after start). The FileFrameGenerator
-    // also updates duration from the last event timestamp, so this is a
-    // secondary source — whichever is larger wins.
+    // Query duration from OSC (ready after start). OSC may not be ready
+    // immediately after start() — retry for up to 500 ms (same pattern as
+    // ExporterController::run_avi). Without this, a short file whose OSC
+    // isn't ready in time would emit opened(0), showing "0 us" in the UI.
+    // The FileFrameGenerator also updates duration from the last event
+    // timestamp, so this is a secondary source — whichever is larger wins.
     duration_us_ = query_duration();
+    for (int waited = 0; waited < 500 && duration_us_ == 0; waited += 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        duration_us_ = query_duration();
+    }
     if (auto* fp = controller_->frame_pipeline()) {
         fp->set_file_duration_us(duration_us_);
-        fp->set_file_loop(loop_);
     }
     at_eof_ = false;
     // Auto-start playback.
@@ -248,7 +267,9 @@ Metavision::timestamp PlaybackController::query_duration() const {
     }
     auto* cam = controller_->camera_handle();
     if (!cam) {
-        return 0;
+        // External file source (AEDAT4/ALPDATA): duration comes from the
+        // reader's metadata instead of the SDK's offline streaming control.
+        return controller_->external_duration_hint();
     }
     try {
         auto& osc = cam->offline_streaming_control();

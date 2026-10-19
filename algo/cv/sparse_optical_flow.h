@@ -3,6 +3,10 @@
 // Self-developed (design §4.3.9), inspired by the jAER rbodo optical-flow suite
 // and ClusterBasedOpticalFlow. Four modes:
 //   LocalPlanes  — local (x,y,t) plane fit (Benoit 2015); velocity = grad(T)/|grad(T)|².
+//                  注释定档（audit §一-2.2，有意不改实现）：jAER LocalPlanesFlow
+//                  对每个像素施加 50ms 不应期（同一像素 50ms 内只出一个流
+//                  向量）；本实现逐事件拟合，输出密度高 1-2 个数量级。这是
+//                  输出密度差异而非计算错误。
 //   LucasKanade  — ✅ 移植自 jAER LucasKanadeFlow (Benosman 2012).
 //                  Per-event flow from an event-count histogram: central
 //                  first-order spatial derivatives of the histogram, event
@@ -299,8 +303,15 @@ private:
             const Event& e = events[i];
             if (e.x >= width_ || e.y >= height_) continue;
             const int p = e.p & 1;
-            // Add event timestamp to the histogram.
-            lk_ts_[lk_idx(e.x, e.y, p)].push_back(e.t);
+            const Metavision::timestamp cutoff = (e.t > win) ? (e.t - win) : 0;
+            // Add event timestamp to the histogram, pruning the pixel's own
+            // deque FIRST: events in the sr+d border band `continue` below
+            // without ever reaching the neighborhood prune, so a persistent
+            // edge-band pixel's deque grew without bound (unbounded memory
+            // in long sessions whose activity hugs the border).
+            auto& own = lk_ts_[lk_idx(e.x, e.y, p)];
+            own.push_back(e.t);
+            prune_lk_deque(own, cutoff);
             // Need margin of sr + d from border for central first-order derivatives.
             if (e.x < sr + d || e.x >= width_ - sr - d ||
                 e.y < sr + d || e.y >= height_ - sr - d) {
@@ -310,8 +321,6 @@ private:
             for (int jj = -sr - d; jj <= sr + d; ++jj) {
                 for (int ii = -sr - d; ii <= sr + d; ++ii) {
                     auto& dq = lk_ts_[lk_idx(e.x + ii, e.y + jj, p)];
-                    const Metavision::timestamp cutoff =
-                        (e.t > win) ? (e.t - win) : 0;
                     prune_lk_deque(dq, cutoff);
                 }
             }

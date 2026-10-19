@@ -27,9 +27,11 @@
 #define GUI_MAIN_WINDOW_H
 
 #include <QHash>
+#include <QCheckBox>
 #include <QMainWindow>
 #include <QPointer>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,7 +39,6 @@
 
 #include <metavision/sdk/base/utils/callback_id.h>
 #include <metavision/sdk/base/events/event_cd.h>
-#include <metavision/sdk/core/utils/colors.h>
 
 #include "algo_bridge/algo_bridge.h"
 #include "app/camera_controller.h"
@@ -67,7 +68,9 @@ namespace gui {
 class PlaybackControls;
 class ExportDialog;
 class CalibrationWizard;
-class SharpnessDialog;
+class FocusDialog;
+class ImuWindow;
+class ApsWindow;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -92,22 +95,37 @@ private slots:
     void on_save_biases();
     void on_load_biases();
     void on_toggle_roi_drag(bool on);
+    /// Shared handler for both pages' "Enable ROI" checkboxes (Phase 2.6
+    /// debug D-6): applies the stored rect (default center 256×144 when
+    /// unset) and opens the settings dialog when turned on.
+    void on_roi_enable_toggled(bool on);
+    /// Opens the modal unified-ROI settings dialog (Phase 2.6 debug D-6).
+    void open_roi_settings_dialog();
 
     // Phase 3 — recording / playback.
     void on_record_start();
+    void do_record_start(const QString& path, bool save_biases,
+                         bool include_imu, bool include_aps);
     void on_record_stop();
     void on_record_elapsed(std::chrono::seconds s);
 
-    // Phase 4 — export / presets.
+    // Phase 4 — export.
     void on_export_dialog();
-    void on_apply_preset(int index);
 
     // Phase 9 — calibration.
     void on_intrinsic_wizard();
-    void on_sharpness();
+    void on_focus();
 
     // Phase 10 — multi-window / layout / standalone algorithm views.
     void on_open_xyt_view();
+    /// Phase 2: IMU stream toggle from the Devices panel (open/close the
+    /// live readout window and start/stop the stream).
+    void on_imu_toggled(bool on);
+    /// Devices-panel IMU toggle (programmatic state sync).
+    void set_imu_ui_state(bool on);
+    /// Phase 3: APS stream toggle from the Devices panel.
+    void on_aps_toggled(bool on);
+    void set_aps_ui_state(bool on);
     void on_open_algo_window(const std::string& algo_name);
     void on_save_layout();
     void on_load_layout();
@@ -155,13 +173,6 @@ private:
     void remove_algo_callback();
     void process_algo_results(QImage& frame);
 
-    /// Re-renders the main display frame from an algorithm's filtered event
-    /// stream (audit §五-G1). Uses the same Metavision palette/background as
-    /// FileFrameGenerator::render_frame so the re-injected stream keeps the
-    /// exact look of the normal display pipeline.
-    void render_filtered_events_frame(
-        QImage& frame, const std::vector<Metavision::EventCD>& events);
-
     /// File playback: feeds the events in the current accumulation window
     /// (emitted by FileFrameGenerator) to all live AlgoInstances and to the
     /// XYT 3D display, synchronously with the displayed frame. This replaces
@@ -171,6 +182,36 @@ private:
                                 Metavision::timestamp ts);
 
     EventDisplayWidget* display_{nullptr};
+    /// Main-display ROI view-mode toggle (Phase 2.6 step 4), in a bar below
+    /// the main display: checked = (a) adaptive zoom (frame cropped to the
+    /// unified ROI and scaled to the window); unchecked = (b) full canvas
+    /// with only-ROI content (default). Enabled only while the unified ROI
+    /// is active.
+    QCheckBox* roi_zoom_cb_{nullptr};
+    /// Dialog-initiated ROI draw in flight (Phase 2.6 debug D-6 follow-up):
+    /// while roi_draw_pending_ is true, the next roi_dragged applies the
+    /// drawn rect directly (the dialog stays closed, no confirmation).
+    bool roi_draw_pending_{false};
+    /// Saved unified-ROI state for the default-ROI automation (Phase 2.6
+    /// debug D-7): heavy algorithms force the center 256×144 ROI on enable
+    /// and restore this prior state on disable.
+    struct RoiAutomationSave {
+        bool enabled;
+        int x0, y0, x1, y1;
+        bool roni;
+    };
+    std::optional<RoiAutomationSave> roi_automation_save_;
+    /// Saved shared-downsample state for the E2VID automation (Phase 3):
+    /// E2VID forces the 1/4 downsample ON while enabled; this prior state
+    /// is restored on disable.
+    std::optional<bool> e2v_downsample_save_;
+    /// Shared tail of "algorithm disabled": restores the unified-ROI and
+    /// E2VID downsample automation state saved at enable time. Runs on BOTH
+    /// disable paths — the sidebar checkbox (algorithm_toggled handler) and
+    /// the AlgoWindow's own close (whose closing handler only disables the
+    /// instance and unchecks the sidebar with signals blocked, so no
+    /// toggled signal fires there).
+    void restore_algo_automation(const std::string& key);
     SettingsPanel* settings_{nullptr};
     QDockWidget* settings_dock_{nullptr};  ///< Right-dock wrapper, for hide/show.
     PlaybackControls* playback_controls_{nullptr};
@@ -210,13 +251,14 @@ private:
     ExporterController exporter_;
     ConfigManager config_;
     ExportDialog* export_dialog_{nullptr};
+    class RecordDialog* record_dialog_{nullptr};
 
     // Phase 5.
     FileConverter file_converter_;
 
     // Phase 9 — owned lazily; built when the wizard is first opened.
     CalibrationWizard* calibration_wizard_{nullptr};
-    SharpnessDialog*   sharpness_dialog_{nullptr};
+    FocusDialog*       focus_dialog_{nullptr};
 
     // Phase 10 — layout manager is owned from construction.
     std::unique_ptr<LayoutManager> layout_manager_;
@@ -227,14 +269,19 @@ private:
     // (algo_windows_) for both parameter control and result display.
     QPointer<SpaceTimeDisplay> xyt_display_;
     std::shared_ptr<AlgoInstance> xyt_algo_;
+    // Phase 2: live IMU readout window (inivation sources only).
+    QPointer<ImuWindow> imu_window_;
+    // Phase 3: live APS frame preview window (DAVIS only).
+    QPointer<ApsWindow> aps_window_;
 
     /// Generic AlgoWindow instances keyed by algo name (design §5.6.6).
     /// Every self-developed algorithm gets an AlgoWindow when enabled, so the
     /// user can adjust any parameter (including the 5 ROI params) at runtime.
     QHash<std::string, QPointer<AlgoWindow>> algo_windows_;
 
-    // Algorithm event/result pipeline.
-    std::optional<Metavision::CallbackId> algo_cd_cb_id_;
+    // Algorithm event/result pipeline. The live event feed is the
+    // conditioned-stream listener on CameraController (install_algo_callback)
+    // — no per-camera SDK callback ID is held here anymore.
     std::atomic<Metavision::timestamp> algo_last_xyt_post_us_{0};
     FrameAnnotator annotator_;
     Metavision::timestamp prev_frame_ts_{0};
@@ -242,10 +289,6 @@ private:
     /// file-mode "Display FPS" metric (event timestamps are meaningless
     /// there — audit §六-P6).
     std::chrono::steady_clock::time_point prev_frame_wall_{};
-
-    /// Current display palette, tracked in update_palettes() so the §五-G1
-    /// filtered-events re-render uses the same colors as the main pipeline.
-    Metavision::ColorPalette display_palette_{Metavision::ColorPalette::Dark};
 
     /// True while closeEvent() is tearing down; AlgoWindow `closing`
     /// handlers skip modal report dialogs in that case (audit §六-M3).
@@ -263,14 +306,6 @@ private:
     /// button. Used to restore the width when content is shown again
     /// (§11.2 point 5). 0 means no saved width (first toggle or never set).
     int saved_sidebar_width_{0};
-
-    /// Draws the ROI rectangle of any enabled self-developed algorithm
-    /// (design §5.6.6: all self-developed algos support ROI) on the main
-    /// display frame so the user can see which region is being processed.
-    /// Called from process_algo_results() with the already-snapshotted
-    /// instances vector to avoid a redundant list_live() call (N7).
-    void draw_roi_overlays(QImage& frame,
-                           const std::vector<std::shared_ptr<AlgoInstance>>& instances);
 
     /// Application theme controller (background color + light/dark mode).
     /// Owned by MainWindow; the SettingsPanel sidebar exposes its UI.

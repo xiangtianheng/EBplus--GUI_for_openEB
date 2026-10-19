@@ -10,6 +10,13 @@ This repository keeps the platform-neutral product and the macOS support layer
 separate. Do not add macOS packaging or dependency support back to `main`
 without an explicit decision to change this policy.
 
+- Upstream: `Ziqing7226/EBplus__more-than-gui-for-openeb`, branch `main`.
+  This repository has no `master` branch.
+- macOS fork: `xiangtianheng/EBplus--GUI_for_openEB`. Publish macOS work here
+  and target its `develop-MacOS` branch for integration reviews.
+- `origin` tracks upstream; `fork` tracks the macOS fork. Fetch upstream
+  changes from `origin/main` and push adaptation branches to `fork`.
+
 ### Branch Roles
 
 - `main` contains platform-neutral product code and is the target for generic
@@ -19,7 +26,7 @@ without an explicit decision to change this policy.
   packaging, and macOS-only tests.
 - `feature/<name>` branches from `main` and targets `main`.
 - `macos/<name>` branches from `develop-MacOS` and targets `develop-MacOS`.
-- `sync/main-<short-sha>` is a temporary integration branch used only to bring
+- `codex/sync-main-<short-sha>` is a temporary integration branch used only to bring
   a specific `main` revision into `develop-MacOS`.
 
 ### Daily Rules
@@ -41,21 +48,23 @@ without an explicit decision to change this policy.
 Use a reviewable synchronization pull request whenever `main` updates need to
 reach the macOS integration line:
 
-1. Fetch both branches and create `sync/main-<short-sha>` from the current
+1. Fetch upstream and fork, then create `codex/sync-main-<short-sha>` from the current
    `develop-MacOS`.
 2. Integrate the selected `main` revision into that temporary branch.
 3. Resolve conflicts by keeping generic behavior owned by `main` and macOS
    build/package glue owned by `develop-MacOS`.
 4. Run the relevant macOS build and test checks.
-5. Open a pull request from `sync/main-<short-sha>` to `develop-MacOS`.
+5. Push to `fork` and open a pull request from `codex/sync-main-<short-sha>`
+   to the fork's `develop-MacOS` branch.
 
 Do not automate a rebase of the shared branch. Future automation may create
 the synchronization branch and pull request, but it must leave conflict
 resolution, test review, and merge approval visible to maintainers.
 
-### Current Transition
+### Preserving Upstream Behavior
 
-`main` historically reverted the original macOS commits. Before the recurring
-synchronization process begins, establish `develop-MacOS` as an explicit
-overlay on the current `main` tip by replaying the macOS commits and the
-macOS-specific compatibility changes in a dedicated, reviewed bootstrap PR.
+Upstream has rewritten some history and removed older GUI and algorithm
+modules. During synchronization, use the current upstream versions of generic
+code and preserve only the macOS build/runtime overlay. Review the final diff
+against `origin/main`; do not resurrect removed modules or reapply old audit
+fixes just because they remain in the macOS branch's history.

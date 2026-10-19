@@ -3,7 +3,9 @@
 // ✅ 移植自 jAER HoughCircleTracker (net.sf.jaer.eventprocessing.tracking.
 // HoughCircleTracker, by Jan Funke / Lorenz Muller). 本实现忠实复刻 jAER 的
 // 算法结构：单固定半径 + 2D 累加器 (width×height) + 非指数衰减
-// 1/(0.0001*decay*dt) + FIFO 事件历史 + 整数椭圆绘制 (8 扇区) + 位置抑制
+// 1/(0.0001*decay*dt)（dt 小于参考周期 T 时按 exp((dt-T)/T) 续延，见
+// accumulate_only 注释——jAER 原公式在该区间会放大，但其渲染周期包节奏
+// 下永不触发）+ FIFO 事件历史 + 整数椭圆绘制 (8 扇区) + 位置抑制
 // (locDepression) NMS，无持久航迹 ID。对应设计 §4.3.15。Header-only.
 //
 // 与 jAER 的少量差异（为兼容既有 backend/test API 所做，不影响算法语义）：
@@ -48,17 +50,18 @@ struct HoughCircle {
 /// Maintains a single fixed-radius 2D accumulator. Each event votes for all
 /// circle centers on the integer ellipse of radius `max_radius_px` around it
 /// (8-sector integer ellipse drawing). The accumulator decays each packet by
-/// the non-exponential factor 1/(0.0001*decay*dt). A FIFO event history is
-/// kept; when `decay_mode` is off, the least recent event's votes are
-/// subtracted. Local maxima above `threshold` are reported, and their
-/// neighborhoods are suppressed via `loc_depression`.
+/// the non-exponential factor 1/(0.0001*decay*dt) for dt >= T (jAER-exact)
+/// and exp((dt-T)/T) below T, where T = 1/(0.0001*decay). A FIFO event
+/// history is kept; when `decay_mode` is off, the least recent event's
+/// votes are subtracted. Local maxima above `threshold` are reported, and
+/// their neighborhoods are suppressed via `loc_depression`.
 class HoughCircleTracker {
 public:
     /// @brief Constructor.
     /// @param width, height      Accumulator dimensions (pixels).
     /// @param max_radius_px      The single fixed circle radius (jAER `radius`).
     /// @param threshold          Detection threshold (jAER `threshold`; default
-    ///                           30 here vs jAER 15, intentional).
+    ///                           15, jAER-aligned since P9).
     /// @param decay              jAER decay coefficient (default 1.0).
     /// @param buffer_length      FIFO event history length (default 4000).
     /// @param nr_max             Number of maxima to track (default 1).
@@ -66,7 +69,7 @@ public:
     /// @param loc_depression     If true, suppress detected neighborhoods.
     HoughCircleTracker(int width, int height,
                        int max_radius_px = 50,
-                       int threshold = 30,
+                       int threshold = 15,
                        float decay = 1.0f,
                        int buffer_length = 4000,
                        int nr_max = 1,
@@ -88,21 +91,49 @@ public:
     }
 
     /// 衰减 + 事件累积，不做峰值扫描（供节流路径每包调用）。
-    void accumulate_only(const EventPacket& packet) {
-        if (packet.empty()) return;
-        if (width_ <= 0 || height_ <= 0) return;
+    ///
+    /// @param cur_t 显式时间戳供衰减计算使用。审计 §11.2-H：当 ROI/预处理
+    /// 滤掉了包尾事件、或整个包被滤空时，algo 的 last_t_ 会停滞，下一包
+    /// 的 dt 被夸大、衰减失真。调用方（HoughCircleBackend）应传
+    /// passthrough_.back().t 以保证 last_t_ 单调推进。默认 -1 = 用
+    /// packet.back().t（向后兼容 process() 与单元测试）。
+    void accumulate_only(const EventPacket& packet,
+                         Metavision::timestamp cur_t = -1) {
+        // Resolve cur_t: if not provided, use packet.back().t. If neither is
+        // available (empty packet, no explicit cur_t), bail — nothing to do.
+        if (cur_t < 0) {
+            if (packet.empty()) return;
+            cur_t = packet[packet.size() - 1].t;
+        }
 
-        const Metavision::timestamp cur_t = packet[packet.size() - 1].t;
-
-        // jAER non-exponential decay: factor = 1/(0.0001*decay*dt).
-        if (decay_mode_ && decay_ > 0.0f) {
+        // Decay (P9, 2026-08-22): TIME-INVARIANT exp(-dt/tau) with
+        // tau = 3T/ln3, T = 1/(0.0001*decay) (jAER's "T" = 10 ms at decay=1).
+        // Rationale: jAER applies factor = T/dt ONCE PER RENDER PACKET
+        // (~30 ms), where it compounds to ~1/3 per 30 ms. Our packets are
+        // SDK batches (live ~1-5 ms) — reusing T/dt or the former
+        // exp((dt-T)/T) small-dt branch multiplied the accumulator by ~0.4
+        // at EVERY 1 ms batch (0.4^30 ≈ 2e-12 per 30 ms vs jAER's 1/3, a
+        // ~25x over-decay that made live detection nearly impossible).
+        // exp(-dt/tau) with tau = 3T/ln3 matches jAER's accumulated decay at
+        // its native 30 ms cadence (exp(-30/27.3) ≈ 1/3) and is composable
+        // at any packet cadence; factor → 1 as dt → 0.
+        // Apply even when the packet is empty (cur_t provided) so last_t_
+        // stays monotonic across ROI-filtered empty packets (§11.2-H).
+        if (width_ > 0 && height_ > 0 && decay_mode_ && decay_ > 0.0f) {
             const float dt = static_cast<float>(cur_t - last_t_);
             if (dt > 0.0f) {
-                const float decay_factor = 1.0f / (0.0001f * decay_ * dt);
+                const float ref_us = 1.0f / (0.0001f * decay_);  // jAER "T"
+                const float tau = ref_us * 3.0f / std::log(3.0f);
+                const float decay_factor = std::exp(-dt / tau);
                 for (float& v : accum_) v *= decay_factor;
             }
         }
         last_t_ = cur_t;
+
+        // Empty packet (with explicit cur_t): timestamp advanced, nothing
+        // else to do.
+        if (packet.empty()) return;
+        if (width_ <= 0 || height_ <= 0) return;
 
         // Reset running maxima for this packet (jAER resets maxValue, keeps
         // maxCoordinate so the last known position persists across packets).
