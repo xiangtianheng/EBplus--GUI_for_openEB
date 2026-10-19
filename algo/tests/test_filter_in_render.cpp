@@ -162,8 +162,8 @@ int main(int argc, char** argv) {
         const std::string yml = "/tmp/gui_test_calib.yml";
         cv::FileStorage fs(yml, cv::FileStorage::WRITE);
         fs << "image_width" << W << "image_height" << H;
-        cv::Mat K = (cv::Mat_<double>(3, 3) << 80, 0, 50, 0, 80, 50, 0, 0, 1);
-        cv::Mat dist = (cv::Mat_<double>(1, 5) << -0.25, 0.08, 0.0, 0.0, 0.0);
+        cv::Mat K = cv::Mat_<double>({3, 3}, {80, 0, 50, 0, 80, 50, 0, 0, 1});
+        cv::Mat dist = cv::Mat_<double>({1, 5}, {-0.25, 0.08, 0.0, 0.0, 0.0});
         fs << "camera_matrix" << K << "distortion_coefficients" << dist;
         fs.release();
 

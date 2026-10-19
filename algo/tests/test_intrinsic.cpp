@@ -44,7 +44,7 @@ SyntheticViews make_views(std::size_t n_views,
     const double fx = 500.0, fy = 500.0, cx = 320.0, cy = 240.0;
 
     SyntheticViews sv;
-    sv.K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+    sv.K = cv::Mat_<double>({3, 3}, {fx, 0, cx, 0, fy, cy, 0, 0, 1});
 
     // Object grid: 9×6 inner corners at (c·20, r·20, 0) mm.
     for (int r = 0; r < kRows; ++r)
