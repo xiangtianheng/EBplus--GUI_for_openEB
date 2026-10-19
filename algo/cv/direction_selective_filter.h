@@ -45,8 +45,9 @@ public:
         : width_(width), height_(height),
           cx_(static_cast<double>(width) / 2.0),
           cy_(static_cast<double>(height) / 2.0),
-          surface_(static_cast<std::size_t>(width) * height, 0),
-          ori_surface_(static_cast<std::size_t>(kNumDirections) * width * height, 0) {
+          // -1 = "never seen" sentinel (0 is a legal timestamp, §四-低8)
+          surface_(static_cast<std::size_t>(width) * height, -1),
+          ori_surface_(static_cast<std::size_t>(kNumDirections) * width * height, -1) {
         global_hist_.fill(0);
     }
 
@@ -79,9 +80,9 @@ public:
     int classify(const Event& e) {
         int dir = -1;
         if (e.x < width_ && e.y < height_) {
+            surface_[idx_of(e.x, e.y)] = e.t;  // own timestamp first (jAER order)
             const DirResult r = compute_direction(e);
             dir = r.dir;
-            surface_[idx_of(e.x, e.y)] = e.t;
             if (dir >= 0) {
                 if (enable_global_mode_) ++global_hist_[dir];
                 update_motion(e, r);
@@ -91,17 +92,24 @@ public:
     }
 
     /// @brief Orientation-aware classify: searches only the two directions
-    /// @p unitDirs[ori] and @p unitDirs[(ori+4)%8] (per spec) out to
-    /// search_distance_, restricted to the same orientation+polarity channel.
+    /// perpendicular to the edge orientation (jAER unitDirs[o]/unitDirs[(o+4)%8]
+    /// with unitDirs starting at down; in this class's E-based table that maps
+    /// to {(ori+2)%8, (ori+6)%8}) out to search_distance_, restricted to the
+    /// same orientation+polarity channel.
     /// If @p ori is not in [0,3], falls back to the raw 8-neighbour path.
     int classify(const Event& e, int ori) {
         if (ori < 0 || ori >= kNumOrientations) return classify(e);
         int dir = -1;
         if (e.x < width_ && e.y < height_) {
             const int pol = e.p ? 1 : 0;
+            // jAER order (rbodo AbstractMotionFlowIMU.extractEventInfo ->
+            // isInvalidTimestamp): the event's own timestamp is written to
+            // lastTimesMap[x][y][type] BEFORE the perpendicular search.
+            // Functionally equivalent for s >= 1 (the own pixel is never
+            // searched), kept for strict flow alignment.
+            ori_surface_[idx_of_ori(e.x, e.y, ori, pol)] = e.t;
             const DirResult r = compute_direction_ori(e, ori, pol);
             dir = r.dir;
-            ori_surface_[idx_of_ori(e.x, e.y, ori, pol)] = e.t;
             if (dir >= 0) {
                 if (enable_global_mode_) ++global_hist_[dir];
                 update_motion(e, r);
@@ -111,11 +119,23 @@ public:
     }
 
     /// @brief Classifies a batch (raw fallback); fills @p out (resized to count).
+    /// Per-batch 10% decay toward zero: the overlay is meant to show the
+    /// RECENT direction distribution ("over the current batch" per the
+    /// accessor comment), but the counters only ever grew -- the text
+    /// climbed without bound (signed overflow on long sessions) and the
+    /// dominant direction locked in early. Runs at BOTH process() exits so
+    /// the raw and orientation-aware paths decay identically.
+    void decay_histogram_batch() {
+        if (enable_global_mode_) {
+            for (auto& cnt_bin : global_hist_) cnt_bin = (cnt_bin * 9) / 10;
+        }
+    }
     void process(const Event* events, std::size_t count, std::vector<int>& out) {
         out.resize(count);
         for (std::size_t i = 0; i < count; ++i) {
             out[i] = classify(events[i]);
         }
+        decay_histogram_batch();
     }
 
     /// @brief Classifies a batch with per-event orientations (orientation-aware).
@@ -126,6 +146,7 @@ public:
         for (std::size_t i = 0; i < count; ++i) {
             out[i] = classify(events[i], oris[i]);
         }
+        decay_histogram_batch();
     }
 
     /// @brief Processes an event packet (raw fallback; updates state + histogram).
@@ -183,8 +204,8 @@ public:
     }
 
     void reset() {
-        std::fill(surface_.begin(), surface_.end(), 0);
-        std::fill(ori_surface_.begin(), ori_surface_.end(), 0);
+        std::fill(surface_.begin(), surface_.end(), -1);
+        std::fill(ori_surface_.begin(), ori_surface_.end(), -1);
         global_hist_.fill(0);
         tx_.reset(); ty_.reset(); rot_.reset(); exp_.reset();
         last_delay_us_ = 0;
@@ -217,6 +238,8 @@ private:
         int dir{-1};
         Metavision::timestamp delay{0};  // dt to the supporting neighbour (us)
         int distance{0};                 // pixels to the supporting neighbour
+        double speed_px_s{0.0};          // jAER aggregate speed (px/s) when
+                                         // distance==0 (aggregate path)
     };
 
     /// Raw/degraded: search the 8 immediate neighbours for the smallest positive
@@ -230,7 +253,7 @@ private:
             const int ny = e.y + kDirDy[d];
             if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) continue;
             const Metavision::timestamp lt = surface_[idx_of(nx, ny)];
-            if (lt == 0) continue;
+            if (lt < 0) continue;  // -1 = never seen
             const Metavision::timestamp rec = e.t - lt;
             if (rec <= min_dt_us_ || rec > win) continue;
             if (rec < best.delay) {
@@ -243,14 +266,28 @@ private:
         return best;
     }
 
-    /// Orientation-aware: search only directions ori and (ori+4)%8 out to
-    /// search_distance_ pixels, restricted to the same orientation+polarity
-    /// channel (per spec).
+    /// Orientation-aware: search only the two directions perpendicular to the
+    /// edge orientation out to search_distance_ pixels, restricted to the same
+    /// orientation+polarity channel (per spec).
+    /// 方向表换算（§一-1.2，修正 90° 错位）：jAER unitDirs 从 down 起
+    /// (unitDirs[0]=(0,-1))，朝向通道 o 搜 unitDirs[o] 与 unitDirs[(o+4)%8]，
+    /// 即 o=0（水平边缘）搜 down/up —— 垂直于边缘。本表 0=E（kDirDx/kDirDy），
+    /// 同一搜索对应 {(ori+2)%8, (ori+6)%8}（ori=0 → N/S）。
     DirResult compute_direction_ori(const Event& e, int ori, int pol) const {
+        // jAER rbodo DirectionSelectiveFlow.filterPacket: for each of the two
+        // directions perpendicular to the edge, iterate s = 1..searchDistance,
+        // COUNT the in-window matches (n1/n2) and SUM their speeds
+        // (s/dt, px/us). The motion direction is the one with MORE evidence;
+        // on a tie the SLOWER average speed wins; speed = sum/count * 1e6
+        // (px/s). This replaces the former single-minimum-delay decision,
+        // which picked one nearest neighbour instead of the aggregate.
         const Metavision::timestamp win = time_window_us_;
-        const int dirs[2] = {ori, (ori + 4) % kNumDirections};
+        const int dirs[2] = {(ori + 2) % kNumDirections,
+                             (ori + 6) % kNumDirections};
         DirResult best;
-        best.delay = win;
+        best.delay = 0;
+        int n[2] = {0, 0};
+        double speed_sum[2] = {0.0, 0.0};
         for (int dd = 0; dd < 2; ++dd) {
             const int d = dirs[dd];
             const int ddx = kDirDx[d];
@@ -258,19 +295,33 @@ private:
             for (int s = 1; s <= search_distance_; ++s) {
                 const int nx = e.x + s * ddx;
                 const int ny = e.y + s * ddy;
-                if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) break;
+                if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) continue;
                 const Metavision::timestamp lt = ori_surface_[idx_of_ori(nx, ny, ori, pol)];
-                if (lt == 0) continue;
+                if (lt < 0) continue;  // -1 = never seen
                 const Metavision::timestamp rec = e.t - lt;
                 if (rec <= min_dt_us_ || rec > win) continue;
-                if (rec < best.delay) {
-                    best.delay = rec;
-                    best.dir = d;
-                    best.distance = s;
-                }
+                ++n[dd];
+                speed_sum[dd] += static_cast<double>(s) / static_cast<double>(rec);
+                best.delay = std::max(best.delay, rec);
             }
         }
-        if (best.dir < 0) best.delay = 0;
+        int chosen = -1;
+        if (n[0] > 0 || n[1] > 0) {
+            if (n[0] > n[1] || (n[0] == n[1] &&
+                (n[0] == 0 || speed_sum[0] / n[0] <= speed_sum[1] / n[1]))) {
+                chosen = 0;
+            } else {
+                chosen = 1;
+            }
+            best.dir = dirs[chosen];
+            best.distance = 0;  // aggregate — per-neighbour distance not unique
+            // jAER aggregate speed: sum(s/dt)/n * 1e6 (px/s).
+            best.speed_px_s =
+                static_cast<double>(n[chosen]) > 0
+                    ? speed_sum[chosen] / static_cast<double>(n[chosen]) * 1e6
+                    : 0.0;
+            best.delay = best.delay > 0 ? best.delay : 1;
+        }
         return best;
     }
 
@@ -278,14 +329,20 @@ private:
     void update_motion(const Event& e, const DirResult& r) {
         last_delay_us_ = r.delay;
         last_distance_px_ = r.distance;
-        if (r.delay <= 0 || r.distance <= 0) {
+        // Aggregate path (orientation-aware): the speed was already computed
+        // in compute_direction_ori as the chosen side's mean s/dt (px/s).
+        // Raw path (distance>0): speed = distance/delay (single neighbour).
+        double speed = r.speed_px_s;
+        if (r.distance > 0 && r.delay > 0) {
+            speed = static_cast<double>(r.distance) /
+                    static_cast<double>(r.delay) * 1e6;
+        }
+        if (r.delay <= 0 || speed <= 0.0 || r.dir < 0) {
             last_speed_pps_ = 0.0F;
             last_vx_ = 0.0F;
             last_vy_ = 0.0F;
             return;
         }
-        const double speed =
-            static_cast<double>(r.distance) / static_cast<double>(r.delay) * 1e6;
         last_speed_pps_ = static_cast<float>(speed);
         const int d = r.dir;
         // Unit vector of the source direction (diagonals normalised by sqrt(2)).
@@ -336,10 +393,11 @@ private:
                 const double a = 1.0 - std::exp(-dt / tau_us);
                 value += (input - value) * a;
                 last_t = t;
-            } else {
-                // Same / out-of-order timestamp: take the new sample.
-                value = input;
             }
+            // dt <= 0 (same / out-of-order timestamp): keep the old value,
+            // matching jAER LowpassFilter (fac=0) — do NOT adopt the new
+            // sample (§一-1.2; same-timestamp packets would otherwise let the
+            // last sample overwrite the estimate repeatedly).
         }
         void reset() {
             value = 0.0;
@@ -352,7 +410,10 @@ private:
     int height_;
     double cx_{0.0};  // sensor center x (OPT-32)
     double cy_{0.0};  // sensor center y (OPT-32)
-    int time_window_us_{10000};
+    int time_window_us_{10000};  // jAER maxDtThreshold 默认 100000us（此处
+                                 // 10000 为有意收紧，10× 差异）；jAER
+                                 // useAvgDtEnabled（默认 true，用平均 dt
+                                 // 而非最小 recency）未移植
     bool enable_global_mode_{true};
     int min_dt_us_{100};       // jAER minDtThreshold
     int search_distance_{3};   // jAER searchDistance

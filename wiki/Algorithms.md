@@ -1,8 +1,8 @@
 # Algorithms
 
-EB plus ships **59 algorithms** registered in a single `AlgoBridge` registry (`gui/algo_bridge/algo_bridge.cpp`):
+The GUI ships a single `AlgoBridge` algorithm registry (`gui/algo_bridge/algo_bridge.cpp`):
 
-- **29 self-developed** algorithms under `algo/` (21 Computer Vision + 8 Analytics). `intrinsic_calibration` was removed from the registry — it is now a **Tools → Intrinsic Wizard** dialog. Undistortion is available as a stackable preprocessing checkbox in the Algorithms panel (`preproc_undistort_enabled` / `preproc_undistort_path`).
+- **25 registered** algorithms (21 self-developed + 4 OpenEB filter stages). The sidebar shows all self-developed algorithms under a single **Analytics** group (the former Computer Vision group was merged in 2026-08-22). `intrinsic_calibration` was removed from the registry — it is now a **Tools → Intrinsic Wizard** dialog. Undistortion is available as a stackable preprocessing checkbox in the Algorithms panel (`preproc_undistort_enabled` / `preproc_undistort_path`).
 - **30 OpenEB-wrapped** capabilities (10 filters + 7 frame modes + 7 preprocessors + 6 utilities)
 
 Algorithms are **mutually exclusive** — enabling one disables the previous. Each self-developed algorithm supports a global ROI (default: center 128×128) and a shared preprocessing stage. All parameters are adjusted exclusively in the sidebar's **Algorithms** panel; algorithm display windows show only the title and output.
@@ -49,7 +49,7 @@ Implemented in `algo/cv/noise_filter.h`. The GUI exposes parameters based on the
 
 ## Self-Developed Algorithms
 
-### Computer Vision (21)
+### Self-Developed (21) — sidebar group "Analytics"
 
 | Algorithm | Display | Notes |
 |-----------|---------|-------|
@@ -57,51 +57,51 @@ Implemented in `algo/cv/noise_filter.h`. The GUI exposes parameters based on the
 | Orientation Filter | Overlay | jAER SimpleOrientationFilter (min-dt WTA) |
 | Direction Selective Filter | Overlay | jAER DirectionSelectiveFilter |
 | Sparse Optical Flow | Overlay | 4 modes: LocalPlanes / LucasKanade / BlockMatch / ClusterOF |
-| Blob Detector | Overlay | |
+| Dense Optical Flow | Overlay | PlaneFitting / TimeGradient / TripletMatching |
+| Dense Optical Flow (DL) | Standalone | EVFlowNet (Zhu 2018 / Stoffregen ECCV 2020); HSV frame, per-frame auto scale |
+| Blob Detector | Overlay | EMA background + connected components |
 | Object Tracker | Overlay | 4 modes: RCT / Median / Kalman / MultiHypothesis |
-| Corner Detector | Overlay | 3 modes: Harris / FAST / AGAST |
-| Line Segment (ELiSeD) | Overlay | |
+| Corner Detector | Overlay | EndStopped / Harris / FAST / AGAST / Arc* |
+| Line Segment (ELiSeD) | Overlay | timestamp-Sobel gradients |
 | Hough Line Tracker | Overlay | jAER HoughLineTracker |
 | Hough Circle Tracker | Overlay | jAER HoughCircleTracker |
-| Orientation Cluster | Overlay | |
-| Cluster LIF | Overlay | LIF neuron clustering |
-| Background Mask Filter | Replace | 2D histogram background modeling |
-| Perspective Undistort | Passive | |
-| Trigger Synced Filter | Passive | |
-| Bandpass Filter | Overlay | |
-| EIS (Optical Gyro) | Overlay | Electronic image stabilization |
-| Ultra Slow Motion | Passive | Time dilation |
+| Orientation Cluster | Overlay | jAER OrientationCluster |
+| Cluster LIF | Overlay | jAER BlurringTunnelFilter LIF clustering |
+| Background Mask Filter | Replace | jAER Histogram2DFilter background modeling |
+| EIS (Optical Gyro) | Overlay | jAER OpticalGyro, electronic image stabilization |
 | XYT 3D Visualizer | Standalone | GPU 3D point cloud |
-| Overlay | Overlay | Generic overlay |
 | Time Surface | Standalone | Hot / Plasma / Turbo palettes |
+| Event -> Video (E2VID) | Standalone | 6 modes (see below) |
+| Frequency Detector | Overlay | blinking-light frequency detection |
+| Frequency Map | Standalone | flicker-frequency heatmap |
 
-### Analytics (7)
+Removed from the registry: particle_counter / flow_statistics / overlay /
+isi_analyzer / trigger_synced / active_marker / bandpass_filter
+(2026-08-22 provenance cull),
+perspective_undistort (superseded by the preproc undistort stage),
+ultra_slow_motion (Phase 2.5), Auto Bias Controller (now a camera-level
+feature in the Biases panel, not an algorithm), intrinsic_calibration
+(Tools → Intrinsic Wizard).
 
-| Algorithm | Display | Notes |
-|-----------|---------|-------|
-| Active Marker Tracking | Overlay | Sliding-window clustering |
-| Event -> Video (E2VID) | Standalone | 3 modes (see below) |
-| Flow Statistics | Passive | Requires ground-truth |
-| ISI Analyzer | Standalone | Inter-spike interval histograms |
-| Particle Counter | Overlay | Line-crossing counter |
-| Auto Bias Controller | Overlay | Closed-loop bias tuning |
-| Frequency Detector | Standalone | Blinking frequency detection |
+### Calibration
 
-### Calibration (1)
-
-| Algorithm | Display | Notes |
-|-----------|---------|-------|
-| Intrinsic Calibration | Standalone | chessboard / circle_grid / aruco |
+Intrinsic calibration is a **Tools → Intrinsic Wizard** dialog (blinking
+chessboard + two-pass Zhang solver), not a registered algorithm.
 
 ## Event-to-Video (E2VID)
 
-The Event-to-Video algorithm reconstructs grayscale intensity images from raw event streams. It has **3 modes**, selected via the `mode` parameter:
+The Event-to-Video algorithm reconstructs grayscale intensity images from raw event streams. It has **6 modes**, selected via the `mode` parameter:
 
 | Mode | Default | Description |
 |------|---------|-------------|
 | `0 = BardowVariational` | | Non-DL; joint optical-flow + log-intensity variational optimization |
 | `1 = InteractingMaps` | | Non-DL; six interconnected maps (I/G/V/F/C/R) with rotation estimation |
-| `2 = E2VID` | ✅ | DL; ONNX Runtime neural-network inference |
+| `2 = E2VID` | ✅ | DL; rpg_e2vid (Gallego et al. 2019), ONNX inference |
+| `3 = E2VID+` | | DL; Stoffregen et al., ECCV 2020 (FlowNet joint head) |
+| `4 = FireNet+` | | DL; lightweight recurrent net (ibid., ~40K params) |
+| `5 = HyperE2VID` | | DL; hypernetwork per-pixel dynamic convolutions (Ercan et al., IEEE TIP 2024) |
+
+Modes 2–5 share the same DL inference pipeline (and the device/num_bins/postproc parameters) and differ only in the loaded ONNX weights — each mode has its own **model path** parameter, so several weight sets can be installed side by side. Switching modes swaps the model.
 
 **Common parameters** (modes 0, 1): `output_fps` (1–120, default 30), `window_ms`, `decay_tau_ms` (0–5000, default 500).
 
@@ -134,7 +134,33 @@ cmake --build build -- -j$(nproc)
 
 E2VID defaults to 128×128 ROI + 30 fps + 1/4 downsample (64×64 inference → upsampled to 128×128). `num_bins` is auto-determined by the ONNX model's input channel count when a model is loaded.
 
-E2VID parameters exposed in the GUI: model path, `num_bins`, auto-HDR, unsharp amount/sigma, bilateral sigma.
+**Model setup (modes 2–5)**: convert the PyTorch weights once after downloading:
+
+```bash
+# E2VID (mode 2) — rpg_e2vid
+. .venv/bin/activate && python models/convert_to_onnx.py \
+    --input models/E2VID_lightweight.pth.tar --output models/e2vid_lightweight.onnx
+# E2VID+ (mode 3), FireNet+ (mode 4), EVFlowNet flow (dl_optical_flow) — event_cnn_minimal
+python models/convert_event_cnn_minimal_to_onnx.py --model e2vid_plus \
+    --input reconstruction_model.pth --output models/e2vid_plus.onnx
+python models/convert_event_cnn_minimal_to_onnx.py --model firenet_plus \
+    --input firenet_all_cts.pth --output models/firenet_plus.onnx
+python models/convert_event_cnn_minimal_to_onnx.py --model evflownet \
+    --input flow_model.pth --output models/evflownet.onnx
+# HyperE2VID (mode 5)
+python models/convert_hypere2vid_to_onnx.py \
+    --input model.pth --output models/hypere2vid.onnx
+```
+
+> **FireNet+ device note**: the OpenVINO GPU plugin (2026.4, iGPU) executes this graph incorrectly — the output collapses to a near-constant image. The `Auto` device policy therefore resolves FireNet+ to **CPU**; an explicit `GPU` choice is honored but produces the flat output described above (visible as `dev=gpu` in the status line). All other DL modes run correctly on the iGPU.
+
+Notes: E2VID+/FireNet+/HyperE2VID have **no sigmoid head** — their raw output may exceed [0,1]; the display clips like the official pipelines, and **Auto HDR** stretches the range when reconstruction looks flat (typical for FireNet+ on small windows). All models consume RAW voxel grids (no normalization), matching this GUI's voxel builder.
+
+**Sources & licenses** (EB plus redistributes neither weights nor reference code — see the README for download links): rpg_e2vid = GPL-3.0 (imported only at conversion time by your own clone); event_cnn_minimal = no license file, weights shared by the authors for research use; HyperE2VID = MIT. Verify licenses/patents before commercial use.
+
+E2VID parameters exposed in the GUI: model path, inference device, `num_bins`, auto-HDR, unsharp amount/sigma, bilateral sigma.
+
+**Inference device (GPU acceleration, §4.4.2-GPU)**: the `device` parameter selects `Auto` (default) / `CPU` / `GPU`. With **OpenVINO** installed (see compile.md G4), Auto/GPU run the neural inference on the Intel iGPU via OpenVINO — the SAME `.onnx` model files are used, no re-conversion needed (measured ~11× faster than CPU: E2VID 5 ms vs 20 ms per frame at 64×64). Without OpenVINO — or on any GPU load/runtime failure — the engine silently falls back to ONNX Runtime CPU. The active runtime is shown in the algorithm status line (`model=loaded dev=gpu|cpu`).
 
 > **Without ONNX Runtime**: E2VID falls back to a heuristic mode (voxel-grid sum + sigmoid). BardowVariational and InteractingMaps work without any extra setup.
 

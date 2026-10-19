@@ -83,8 +83,6 @@ TEST(DisplayStrategyOverlay, DrawsPrimitivesOntoFrame) {
     auto inst = bridge.find_or_create("object_tracker");  // Overlay
     ASSERT_NE(inst, nullptr);
     inst->set_enabled(true);
-    // Disable ROI so apply() skips the camera-dependent ROI zoom path.
-    inst->set_param("roi_enabled", "false");
 
     QImage frame(120, 120, QImage::Format_RGB888);
     frame.fill(Qt::black);
@@ -115,13 +113,70 @@ TEST(DisplayStrategyOverlay, DrawsPrimitivesOntoFrame) {
     EXPECT_NE(frame.pixel(50, 50), before.pixel(50, 50));
 }
 
+// P7: flow arrows are drawn on the frame (sparse/dense optical flow).
+TEST(DisplayStrategyOverlay, FlowArrowsPaintOnFrame) {
+    AlgoBridge bridge;
+    auto inst = bridge.find_or_create("object_tracker");  // Overlay
+    ASSERT_NE(inst, nullptr);
+    inst->set_enabled(true);
+
+    QImage frame(80, 80, QImage::Format_RGB888);
+    frame.fill(Qt::black);
+    const QImage before = frame.copy();
+
+    AlgoResult r;
+    gui::OverlayFlowArrow a;
+    a.x1 = 20; a.y1 = 40; a.x2 = 60; a.y2 = 40;
+    r.flow_arrows.push_back(a);
+
+    QHash<std::string, QPointer<gui::AlgoWindow>> windows;
+    FrameAnnotator annotator;
+    auto ctx = make_ctx(annotator, windows);
+
+    inst->apply_strategy(frame, r, ctx);
+    EXPECT_NE(frame, before);
+    // A pixel on the arrow shaft must have changed.
+    EXPECT_NE(frame.pixel(40, 40), before.pixel(40, 40));
+}
+
+// Regression (P0, 2026-08-22): colored_events must actually paint on the
+// display pipeline's Format_RGB888 frames. QImage::setPixel only supports
+// 32-bit/indexed formats and silently no-ops on 24-bit RGB888 — orientation
+// / direction coloring was therefore never visible. The annotator now
+// writes RGB888 through the scanline pointer.
+TEST(DisplayStrategyOverlay, ColoredEventsPaintOnRgb888) {
+    AlgoBridge bridge;
+    auto inst = bridge.find_or_create("object_tracker");  // Overlay
+    ASSERT_NE(inst, nullptr);
+    inst->set_enabled(true);
+
+    QImage frame(80, 80, QImage::Format_RGB888);
+    frame.fill(Qt::black);
+    const QImage before = frame.copy();
+
+    AlgoResult r;
+    gui::ColoredEvent ce;
+    ce.event.x = 40; ce.event.y = 40;
+    ce.event.p = 1;
+    ce.r = 255; ce.g = 0; ce.b = 0;
+    r.colored_events.push_back(ce);
+
+    QHash<std::string, QPointer<gui::AlgoWindow>> windows;
+    FrameAnnotator annotator;
+    auto ctx = make_ctx(annotator, windows);
+
+    inst->apply_strategy(frame, r, ctx);
+    EXPECT_NE(frame, before);
+    // (40,40) must now be red (qRgb(255,0,0) = 0xFFFF0000).
+    EXPECT_EQ(frame.pixel(40, 40), 0xFFFF0000);
+}
+
 // Overlay with no primitives and ROI off: frame unchanged (nothing to draw).
 TEST(DisplayStrategyOverlay, EmptyResultLeavesFrameUnchanged) {
     AlgoBridge bridge;
     auto inst = bridge.find_or_create("object_tracker");
     ASSERT_NE(inst, nullptr);
     inst->set_enabled(true);
-    inst->set_param("roi_enabled", "false");
 
     QImage frame(60, 60, QImage::Format_RGB888);
     frame.fill(Qt::white);

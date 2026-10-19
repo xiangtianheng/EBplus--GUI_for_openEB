@@ -141,6 +141,10 @@ public:
                         static_cast<std::size_t>(ny) * width_ + nx;
                     const Cell& nb = vector_map_[nidx];
 
+                    // Time regression (e.t < nb.ts, e.g. seek without reset):
+                    // skip the neighbor — factor/dt would otherwise go
+                    // negative or blow up (§四-低9; jAER 原版同样不防).
+                    if (e.t < nb.ts) continue;
                     // Time gap (+1 to avoid division by zero), matches jAER.
                     const float t = static_cast<float>(e.t - nb.ts) + 1.0f;
                     if (t >= dt_) continue;
@@ -149,6 +153,8 @@ public:
                     // OPT-29: (xx, yy) and vl depend only on (w, h, same_pol),
                     // not on runtime event data — safe to precompute.
                     const bool same_pol = (cur.pol == nb.pol);
+                    // useOppositePolarity=false: jAER 因未重置 xx/yy 会累加
+                    // 陈旧向量（jAER bug）；本实现直接跳过该邻居（§二-2.8）。
                     if (!same_pol && !use_opposite_polarity_) continue;
 
                     const std::size_t uidx =
@@ -183,7 +189,13 @@ public:
             // Neighborhood orientation and length (jAER uses atan(x/y)).
             const float neighbor_length =
                 std::sqrt(neighbor_x * neighbor_x + neighbor_y * neighbor_y);
-            const float neighbor_theta = std::atan(neighbor_x / neighbor_y);
+            // jAER uses atan(x/y) relying on the y>=0 convention; guard the
+            // degenerate y==0 (pure-horizontal neighborhood) so we never
+            // divide by zero. atan2 keeps the same (-90,90) signed range for
+            // the y>=0 case and is exact at y==0.
+            const float neighbor_theta =
+                (neighbor_y != 0.0f) ? std::atan(neighbor_x / neighbor_y)
+                                     : (neighbor_x >= 0.0f ? kPi / 2.0f : -kPi / 2.0f);
 
             // Current event orientation theta = atan(vx/vy) (angle from the
             // vertical y-axis, jAER convention); blended with history when
@@ -195,7 +207,9 @@ public:
                 vx_eff = cur.vx + history_factor_ * hc.vx;
                 vy_eff = cur.vy + history_factor_ * hc.vy;
             }
-            const float theta = std::atan(vx_eff / vy_eff);
+            const float theta =
+                (vy_eff != 0.0f) ? std::atan(vx_eff / vy_eff)
+                                 : (vx_eff >= 0.0f ? kPi / 2.0f : -kPi / 2.0f);
 
             // Update the history map (mirrors jAER: history := current).
             Cell& hc = history_map_[idx];
@@ -251,12 +265,18 @@ public:
 
     void set_dt(float v) { dt_ = v; }
     void set_factor(float v) { factor_ = v; }
-    void set_rf_width(int v) { rf_width_ = v; rebuild_unit_table(); }
-    void set_rf_height(int v) { rf_height_ = v; rebuild_unit_table(); }
+    // Clamped to [1, 64] (§四-低9): a negative value made rebuild_unit_table()
+    // compute cols <= 0 and attempt a huge allocation.
+    void set_rf_width(int v) { rf_width_ = clamp_rf(v); rebuild_unit_table(); }
+    void set_rf_height(int v) { rf_height_ = clamp_rf(v); rebuild_unit_table(); }
     void set_tolerance(float v) { tolerance_deg_ = v; }
     void set_ori(float v) { ori_deg_ = v; }
     void set_neighbor_thr(float v) { neighbor_thr_ = v; }
-    void set_thr_gradient(float v) { thr_gradient_ = v; }
+    // Clamped to [0, 1] (jAER thrGradient 语义；§四-低9): values > 1 made
+    // dy_thr negative for large y, silently disabling the neighbor threshold.
+    void set_thr_gradient(float v) {
+        thr_gradient_ = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }
     void set_history_factor(float v) { history_factor_ = v; }
     void set_use_opposite_polarity(bool v) { use_opposite_polarity_ = v; }
     void set_ori_history_enabled(bool v) { ori_history_enabled_ = v; }
@@ -325,6 +345,8 @@ private:
     };
 
     static constexpr float kPi = 3.14159265358979323846f;
+
+    static int clamp_rf(int v) { return v < 1 ? 1 : (v > 64 ? 64 : v); }
 
     int width_;
     int height_;

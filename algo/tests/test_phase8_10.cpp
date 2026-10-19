@@ -20,22 +20,16 @@
 #include "algo/cv/orientation_cluster.h"
 #include "algo/cv/cluster_lif.h"
 #include "algo/cv/background_mask_filter.h"
-#include "algo/cv/perspective_undistort.h"
-#include "algo/cv/trigger_synced_filter.h"
-#include "algo/cv/bandpass_filter.h"
 #include "algo/cv/optical_gyro.h"
-#include "algo/cv/ultra_slow_motion.h"
 #include "algo/cv/xyt_visualizer.h"
 #include "algo/cv/time_surface.h"
-#include "algo/analytics/active_marker.h"
+#include "algo/cv/dense_optical_flow.h"
+#include "algo/cv/frequency_map.h"
 #include "algo/analytics/event_to_video.h"
 #include "algo/analytics/e2vid/event_voxel_grid.h"
 #include "algo/analytics/e2vid/intensity_rescaler.h"
 #include "algo/analytics/e2vid/unsharp_mask.h"
 #include "algo/analytics/e2vid/e2vid_inference.h"
-#include "algo/analytics/flow_statistics.h"
-#include "algo/analytics/isi_analyzer.h"
-#include "algo/analytics/particle_counter.h"
 #include "algo/analytics/auto_bias_controller.h"
 #include "algo/analytics/freq_detector.h"
 #include "algo/analytics/sensor_self_test.h"
@@ -49,18 +43,13 @@ using gui_algo::HoughCircleTracker;
 using gui_algo::OrientationCluster;
 using gui_algo::ClusterLIF;
 using gui_algo::BackgroundMaskFilter;
-using gui_algo::PerspectiveUndistort;
-using gui_algo::TriggerSyncedFilter;
-using gui_algo::BandpassFilter;
 using gui_algo::OpticalGyro;
-using gui_algo::UltraSlowMotion;
 using gui_algo::XYTVisualizer;
 using gui_algo::TimeSurface;
-using gui_algo::ActiveMarker;
+using gui_algo::DenseOpticalFlow;
+using gui_algo::FrequencyMap;
+using gui_algo::FrequencyMapParams;
 using gui_algo::EventToVideo;
-using gui_algo::FlowStatistics;
-using gui_algo::ISIAnalyzer;
-using gui_algo::ParticleCounter;
 using gui_algo::AutoBiasController;
 using gui_algo::FreqDetector;
 using gui_algo::SensorSelfTest;
@@ -108,8 +97,8 @@ TEST(LineSegmentDetectorTest, ElisedParams) {
     LineSegmentDetector d(32, 32);
     d.set_max_age_us(50000);
     EXPECT_EQ(d.max_age_us(), 50000);
-    d.set_num_orientations(8);
-    EXPECT_EQ(d.num_orientations(), 8);
+    d.set_min_line_length_px(15);
+    EXPECT_EQ(d.min_line_length_px(), 15);
 }
 // ELiSeD port: a horizontal line of ON events at y=16 with temporal contrast
 // supplied by neighbouring rows (y=15 older, y=17 newer) must produce a
@@ -118,25 +107,29 @@ TEST(LineSegmentDetectorTest, DetectsHorizontalLine) {
     LineSegmentDetector d(48, 48);
     d.set_min_line_length_px(10);
     std::vector<Event> ev;
-    // Pre-fill rows 15 (older) and 17 (newer) for timestamp-contrast.
-    for (int x = 4; x <= 43; ++x) {
-        ev.emplace_back(static_cast<uint16_t>(x), 15, 1, 1000);
-        ev.emplace_back(static_cast<uint16_t>(x), 17, 1, 5000);
-    }
-    // Line row, emitted last so neighbours are already populated.
-    for (int x = 4; x <= 43; ++x) {
-        ev.emplace_back(static_cast<uint16_t>(x), 16, 1, 3000);
+    // Two rounds: the first populates the timestamp map, the second gives
+    // every pixel a complete neighbourhood so the level-line gradient is
+    // well-defined (jAER's online per-event semantics — a single round
+    // leaves early pixels with partial neighbours and no level line).
+    for (int r = 0; r < 2; ++r) {
+        for (int x = 4; x <= 43; ++x) {
+            ev.emplace_back(static_cast<uint16_t>(x), 15, 1, 1000 + r * 10000);
+            ev.emplace_back(static_cast<uint16_t>(x), 17, 1, 5000 + r * 10000);
+        }
+        for (int x = 4; x <= 43; ++x) {
+            ev.emplace_back(static_cast<uint16_t>(x), 16, 1, 3000 + r * 10000);
+        }
     }
     auto pkt = make_packet(ev);
     auto result = d.process(pkt);
     ASSERT_GE(result.size(), 1u);
     // Segment should be roughly horizontal (angle within [0,180) and near 0).
-    EXPECT_GE(result[0].angle, 0.0f);
-    EXPECT_LT(result[0].angle, 180.0f);
+    EXPECT_GT(result[0].angle, -90.0f);
+    EXPECT_LT(result[0].angle, 90.0f);  // near-horizontal: level-line near 0
     const float dx = result[0].end.x - result[0].start.x;
     const float dy = result[0].end.y - result[0].start.y;
     EXPECT_GT(dx * dx, dy * dy);  // horizontal extent dominates
-    EXPECT_GE(result[0].track_id, 0);
+    EXPECT_GT(result[0].length, 0.0f);
 }
 
 // --- 4.3.14 HoughLineTracker ---
@@ -151,9 +144,35 @@ TEST(HoughLineTrackerTest, Params) {
     EXPECT_EQ(t.threshold(), 100);
     t.set_num_theta_bins(45);
     EXPECT_EQ(t.num_theta_bins(), 45);
-    t.set_accumulator_decay_us(50000);
-    EXPECT_EQ(t.accumulator_decay_us(), 50000);
+    t.set_hough_decay_factor(0.5F);
+    EXPECT_FLOAT_EQ(t.hough_decay_factor(), 0.5F);
 }
+// P1 (jAER single-line semantics): a strong vertical line produces AT MOST
+// ONE output line; favor_vertical_range_deg restricts voting to the band
+// around vertical so a horizontal band of events yields no line when the
+// range is narrowed.
+TEST(HoughLineTrackerTest, SingleLineOutputAndFavorVertical) {
+    HoughLineTracker t(100, 100, 90, 0, 50, 0.6F);
+    // Vertical line at x=50.
+    std::vector<Event> ev;
+    for (int i = 0; i < 400; ++i) ev.emplace_back(50, 5 + i % 90, 1, i);
+    auto pkt = make_packet(ev);
+    auto lines = t.process(pkt);
+    EXPECT_LE(lines.size(), 1u);
+    if (!lines.empty()) {
+        // Near-vertical line: endpoints span the image height.
+        EXPECT_NEAR(lines[0].angle, 90.0, 25.0);
+    }
+
+    // Narrow favor-vertical range (5 deg): a HORIZONTAL band of events must
+    // not reach threshold — its votes fall outside the allowed theta band.
+    HoughLineTracker h(100, 100, 90, 0, 50, 0.6F, 10.0, 5.0);
+    std::vector<Event> hev;
+    for (int i = 0; i < 400; ++i) hev.emplace_back(5 + i % 90, 50, 1, i);
+    auto hpkt = make_packet(hev);
+    EXPECT_TRUE(h.process(hpkt).empty());
+}
+
 TEST(HoughLineTrackerTest, ProcessEmpty) {
     HoughLineTracker t(32, 32);
     std::vector<Event> empty;
@@ -170,14 +189,10 @@ TEST(HoughCircleTrackerTest, Construction) {
 }
 TEST(HoughCircleTrackerTest, Params) {
     HoughCircleTracker t(32, 32);
-    t.set_min_radius_px(10);
-    EXPECT_EQ(t.min_radius_px(), 10);
     t.set_max_radius_px(100);
     EXPECT_EQ(t.max_radius_px(), 100);
     t.set_threshold(50);
     EXPECT_EQ(t.threshold(), 50);
-    t.set_accumulator_decay_us(50000);
-    EXPECT_EQ(t.accumulator_decay_us(), 50000);
 }
 TEST(HoughCircleTrackerTest, ProcessEmpty) {
     HoughCircleTracker t(32, 32);
@@ -185,6 +200,105 @@ TEST(HoughCircleTrackerTest, ProcessEmpty) {
     auto pkt = make_packet(empty);
     auto result = t.process(pkt);
     EXPECT_TRUE(result.empty());
+}
+
+TEST(HoughCircleTrackerTest, SmallDtPacketsDoNotAmplifyAccumulator) {
+    // Regression: the jAER decay formula 1/(0.0001*decay*dt) is > 1 for
+    // dt < 10 ms. jAER never hits that branch (render-cycle packets), but
+    // the GUI feeds SDK batches (~1-5 ms) — the accumulator was amplified
+    // every packet until all cells saturated to the same value, and the
+    // scan-order tie-break then reported a phantom circle at the bottom-
+    // right interior cell, persisted by maxCoordinate. The factor is now
+    // jAER-exact for dt >= T and exp((dt-T)/T) below T.
+    HoughCircleTracker t(64, 48);
+    t.set_max_radius_px(8);
+    // Many small-dt packets, one event each at the center.
+    for (int i = 0; i < 500; ++i) {
+        std::vector<Event> ev;
+        ev.emplace_back(32, 24, 1, 1000 + i * 1000);  // 1 ms apart
+        auto pkt = make_packet(ev);
+        t.accumulate_only(pkt);
+    }
+    const auto& accum = t.accum();
+    const float mx = *std::max_element(accum.begin(), accum.end());
+    ASSERT_TRUE(std::isfinite(mx));
+    // No phantom detection at the bottom-right interior cell (62,46) —
+    // the saturated-tiebreak artifact. (A legitimate detection near the
+    // center is fine.)
+    for (const auto& c : t.find_peaks()) {
+        EXPECT_FALSE(std::abs(c.center.x - 62.0F) <= 1.0F &&
+                     std::abs(c.center.y - 46.0F) <= 1.0F)
+            << "phantom bottom-right circle detected";
+    }
+}
+
+TEST(HoughCircleTrackerTest, DecayAppliesAtSmallPacketCadence) {
+    // The earlier clamp-to-1 fix stalled decay below T (factor == 1 for
+    // dt < 10 ms): votes never expired and every persistent structure
+    // became a false-positive circle. The exp continuation must really
+    // shrink the accumulator at small packet cadence.
+    HoughCircleTracker t(64, 48);
+    t.set_max_radius_px(8);
+    std::vector<Event> ev;
+    ev.emplace_back(32, 24, 1, 1000);
+    auto pkt = make_packet(ev);
+    t.accumulate_only(pkt);
+    const float v0 = *std::max_element(t.accum().begin(), t.accum().end());
+    ASSERT_GT(v0, 0.0f);
+    for (int i = 0; i < 20; ++i) {  // +1 ms per empty packet
+        std::vector<Event> empty;
+        auto ep = make_packet(empty);
+        t.accumulate_only(ep, 1000 + (i + 1) * 1000);
+    }
+    const float v1 = *std::max_element(t.accum().begin(), t.accum().end());
+    EXPECT_LT(v1, v0 * 0.5f);
+}
+
+TEST(HoughCircleTrackerTest, DecayMatchesJaeRAtRenderCadence) {
+    // jAER parity must be exact in jAER's operating range (dt >= T):
+    // decay=1, dt=30 ms → factor 1/(0.0001*1*30000) = 1/3.
+    HoughCircleTracker t(64, 48);
+    t.set_max_radius_px(8);
+    std::vector<Event> ev;
+    ev.emplace_back(32, 24, 1, 1000);
+    auto pkt = make_packet(ev);
+    t.accumulate_only(pkt);
+    const float v0 = *std::max_element(t.accum().begin(), t.accum().end());
+    ASSERT_GT(v0, 0.0f);
+    std::vector<Event> empty;
+    auto ep = make_packet(empty);
+    t.accumulate_only(ep, 31000);  // dt = 30000 us
+    const float v1 = *std::max_element(t.accum().begin(), t.accum().end());
+    EXPECT_NEAR(v1 / v0, 1.0f / 3.0f, 0.01f);
+}
+
+// P9 regression: the decay is CADENCE-INVARIANT — 30 x 1 ms packets must
+// decay the accumulator by the same total factor as a single 30 ms packet
+// (the former exp((dt-T)/T) small-dt branch wiped ~0.4 per 1 ms packet,
+// 25x faster than jAER's cadence, killing live detection).
+TEST(HoughCircleTrackerTest, DecayIsCadenceInvariant) {
+    auto prime = [](HoughCircleTracker& t) {
+        std::vector<Event> ev;
+        ev.emplace_back(32, 24, 1, 1000);
+        auto pkt = make_packet(ev);
+        t.accumulate_only(pkt);
+        return *std::max_element(t.accum().begin(), t.accum().end());
+    };
+    HoughCircleTracker a(64, 48), b(64, 48);
+    a.set_max_radius_px(8);
+    b.set_max_radius_px(8);
+    const float v0a = prime(a);
+    const float v0b = prime(b);
+    ASSERT_GT(v0a, 0.0F);
+    std::vector<Event> empty;
+    auto ep = make_packet(empty);
+    for (int i = 1; i <= 30; ++i) a.accumulate_only(ep, 1000 + i * 1000);  // 30x1ms
+    b.accumulate_only(ep, 31000);                                           // 1x30ms
+    const float va = *std::max_element(a.accum().begin(), a.accum().end());
+    const float vb = *std::max_element(b.accum().begin(), b.accum().end());
+    EXPECT_NEAR(va / v0a, vb / v0b, 0.01f);
+    // And the total factor matches jAER's accumulated 1/3 per 30 ms.
+    EXPECT_NEAR(va / v0a, 1.0F / 3.0F, 0.02F);
 }
 
 // --- 4.3.17 OrientationCluster ---
@@ -222,6 +336,38 @@ TEST(ClusterLIFTest, ProcessEmpty) {
     EXPECT_TRUE(result.empty());
 }
 
+// P3 (jAER updateNeurons full-enclosure semantics): sparse firing with no
+// neuron whose ALL neighbours are firing must produce NO cluster — the old
+// 4-CC approximation emitted small clusters jAER never forms. A compact
+// 2x2 block with all four firing IS a cluster (each member has firing
+// neighbours; the interior members are inside neurons).
+TEST(ClusterLIFTest, SparseFiringFormsNoGroup) {
+    ClusterLIF c(64, 48, 22.0f, 2.0f, 0.0f, 8, 50.0f, 10.0f);
+    // One isolated firing neuron: no inside core -> no cluster (jAER).
+    std::vector<Event> ev;
+    ev.emplace_back(16, 16, 1, 1000);
+    for (int k = 0; k < 40; ++k) ev.emplace_back(16, 16, 1, 2000 + k);
+    auto pkt = make_packet(ev);
+    auto result = c.process(pkt);
+    EXPECT_TRUE(result.empty()) << "sparse firing must not form a jAER group";
+}
+
+TEST(ClusterLIFTest, CompactBlockFormsGroup) {
+    ClusterLIF c(64, 48, 22.0f, 2.0f, 0.0f, 8, 50.0f, 10.0f);
+    // Events spread across a 16x16 px area (centred at (16,16)) drive the
+    // four neurons whose centres are (8,8),(16,8),(8,16),(16,16); repeated
+    // firing saturates MP so all four fire -> inside core -> one group.
+    std::vector<Event> ev;
+    for (int k = 0; k < 200; ++k) {
+        const int x = 8 + (k % 16);
+        const int y = 8 + ((k / 16) % 16);
+        ev.emplace_back(x, y, 1, 1000 + k);
+    }
+    auto pkt = make_packet(ev);
+    auto result = c.process(pkt);
+    EXPECT_FALSE(result.empty()) << "a fully-firing block must form a group";
+}
+
 // --- 4.3.19 BackgroundMaskFilter ---
 TEST(BackgroundMaskFilterTest, Construction) {
     BackgroundMaskFilter f(64, 48);
@@ -243,73 +389,6 @@ TEST(BackgroundMaskFilterTest, ProcessEmpty) {
     EXPECT_FALSE(mask.empty());
 }
 
-// --- 4.3.20 PerspectiveUndistort ---
-TEST(PerspectiveUndistortTest, Construction) {
-    PerspectiveUndistort u;
-    EXPECT_TRUE(u.use_lut());
-    EXPECT_TRUE(u.undistort());
-}
-TEST(PerspectiveUndistortTest, Params) {
-    PerspectiveUndistort u;
-    u.set_undistort(false);
-    EXPECT_FALSE(u.undistort());
-    u.set_rectify(true);
-    EXPECT_TRUE(u.rectify());
-}
-
-// --- 4.3.21 TriggerSyncedFilter (jAER FilterSyncedEvents port) ---
-TEST(TriggerSyncedFilterTest, Construction) {
-    TriggerSyncedFilter f;
-    // jAER defaults: t0=500us, t1=500us (window). trigger_window_us() maps to t1.
-    EXPECT_EQ(f.trigger_window_us(), 500);
-    EXPECT_EQ(f.t0(), 500);
-    EXPECT_EQ(f.t1(), 500);
-    EXPECT_EQ(f.trigger_channel(), 0);
-}
-TEST(TriggerSyncedFilterTest, Params) {
-    TriggerSyncedFilter f;
-    f.set_trigger_window_us(50000);
-    EXPECT_EQ(f.trigger_window_us(), 50000);
-    f.set_t0(1000);
-    f.set_t1(2000);
-    EXPECT_EQ(f.t0(), 1000);
-    EXPECT_EQ(f.t1(), 2000);
-    f.set_trigger_channel(3);
-    EXPECT_EQ(f.trigger_channel(), 3);
-}
-TEST(TriggerSyncedFilterTest, ProcessEmpty) {
-    TriggerSyncedFilter f;
-    std::vector<Event> empty;
-    auto pkt = make_packet(empty);
-    auto result = f.process(pkt);
-    EXPECT_TRUE(result.empty());
-}
-
-// --- 4.3.22 BandpassFilter ---
-TEST(BandpassFilterTest, Construction) {
-    BandpassFilter f;
-    EXPECT_DOUBLE_EQ(f.value(), 0.0);
-}
-TEST(BandpassFilterTest, Params) {
-    BandpassFilter f(2.0f, 20.0f, 2, 0.01);
-    f.set_cutoffs(5.0, 50.0);
-    f.set_sample_dt(0.02);
-    SUCCEED();
-}
-TEST(BandpassFilterTest, ProcessScalar) {
-    BandpassFilter f;
-    double y = f.process(100.0);
-    EXPECT_TRUE(std::isfinite(y));
-}
-// Regression: bandpass order must be hp(lp(x)) — low-pass first, then high-pass.
-// Match the common building block algo/common/filter/bandpass.h and jAER.
-// Verify by comparing output to the reference BandpassFilter for a DC input:
-// a band-pass must remove DC, so a constant input must converge toward 0.
-TEST(BandpassFilterTest, RemovesDcAfterConvergence) {
-    BandpassFilter f(0.5f, 10.0f, 4, 0.01);
-    for (int i = 0; i < 1000; ++i) f.process(1.0);
-    EXPECT_NEAR(f.value(), 0.0, 1e-3);
-}
 
 // --- 4.3.23 OpticalGyro ---
 TEST(OpticalGyroTest, Construction) {
@@ -333,33 +412,6 @@ TEST(OpticalGyroTest, Params) {
 // =========================================================================
 // Phase 9: algo/cv/ §4.3.24–4.3.27
 // =========================================================================
-
-// --- 4.3.24 UltraSlowMotion ---
-TEST(UltraSlowMotionTest, Construction) {
-    UltraSlowMotion m;
-    EXPECT_FLOAT_EQ(m.dilation_factor(), 10.0f);
-    EXPECT_EQ(m.min_accumulation_us(), 5);
-}
-TEST(UltraSlowMotionTest, Params) {
-    UltraSlowMotion m;
-    m.set_dilation_factor(100.0f);
-    EXPECT_FLOAT_EQ(m.dilation_factor(), 100.0f);
-    m.set_min_accumulation_us(10);
-    EXPECT_EQ(m.min_accumulation_us(), 10);
-}
-TEST(UltraSlowMotionTest, EquivalentFps) {
-    UltraSlowMotion m;
-    // Default min_accumulation_us=5 -> 1e6/5 = 200000 fps
-    EXPECT_DOUBLE_EQ(m.equivalent_fps(), 200000.0);
-}
-TEST(UltraSlowMotionTest, Process) {
-    UltraSlowMotion m(10.0f, 5);
-    auto ev = make_events(32, 32, 10);
-    auto out = m.process(ev.data(), ev.size());
-    EXPECT_EQ(out.size(), ev.size());
-    // Timestamps should be dilated.
-    EXPECT_GT(out.back().t, ev.front().t);
-}
 
 // --- 4.3.25 XYTVisualizer ---
 TEST(XYTVisualizerTest, Construction) {
@@ -402,32 +454,73 @@ TEST(TimeSurfaceTest, ProcessAndRender) {
     EXPECT_EQ(img.rows, 32);
     EXPECT_EQ(img.cols, 32);
 }
+TEST(TimeSurfaceTest, ExponentialDecay) {
+    // dv Accumulator EXPONENTIAL (accumulator.hpp:119-154): per-event
+    // decay + contribute. Defaults: eventContribution=0.15, neutral=0,
+    // [min,max]=[0,1]. A pixel hit once at t=0, rendered tau later:
+    //   display = 0.15 * exp(-1) ≈ 0.0552 → gray ≈ 14.
+    TimeSurface ts(32, 32, TimeSurface::Channels::Merged, 100000,
+                   TimeSurface::Palette::Gray, 30,
+                   TimeSurface::Decay::Exponential, 100000);
+    EXPECT_EQ(ts.decay(), TimeSurface::Decay::Exponential);
+    EXPECT_EQ(ts.tau_us(), 100000);
+    std::vector<Event> ev;
+    ev.emplace_back(5, 5, 1, 0);         // reference pixel at t=0
+    ev.emplace_back(10, 10, 1, 100000);  // advances current_t_ by exactly tau
+    ts.process(ev.data(), ev.size());
+    cv::Mat img = ts.render();
+    const cv::Vec3b old_px = img.at<cv::Vec3b>(5, 5);
+    const cv::Vec3b new_px = img.at<cv::Vec3b>(10, 10);
+    // pot=0.15; display = 0.15 * exp(-tau/tau) = 0.15*exp(-1) ≈ 14.1
+    const double expect_old = 255.0 * 0.15 * std::exp(-1.0);
+    EXPECT_NEAR(old_px[0], expect_old, 2.0);
+    EXPECT_EQ(old_px[0], old_px[1]);  // Gray palette: all channels equal
+    EXPECT_EQ(old_px[1], old_px[2]);
+    // pot=0.15; dt=0 → display = 0.15 → gray ≈ 38
+    const double expect_new = 255.0 * 0.15;
+    EXPECT_NEAR(new_px[0], expect_new, 2.0);
+    EXPECT_EQ(img.at<cv::Vec3b>(0, 0)[0], 0);  // never-hit pixel stays black
+    // tau_us setter round-trip.
+    ts.set_tau_us(50000);
+    EXPECT_EQ(ts.tau_us(), 50000);
+}
+
+TEST(TimeSurfaceTest, ExponentialAccumulation) {
+    // dv Accumulator: multiple events at the same pixel accumulate
+    // (contribute), saturating to max_potential (1.0). With
+    // eventContribution=0.15 and tau=1s, 10 events 100us apart accumulate
+    // well past 1.0 → clamped to 1.0 → gray 255 (dt≈0 at render).
+    TimeSurface ts(32, 32, TimeSurface::Channels::Merged, 100000,
+                   TimeSurface::Palette::Gray, 30,
+                   TimeSurface::Decay::Exponential, 1000000);
+    std::vector<Event> ev;
+    for (int i = 0; i < 10; ++i)
+        ev.emplace_back(5, 5, 1, i * 100);  // 100us apart, << tau=1s
+    ev.emplace_back(10, 10, 1, 1000);       // single event, advances current_t_
+    ts.process(ev.data(), ev.size());
+    cv::Mat img = ts.render();
+    // 10 events saturate to 1.0; dt=100us → exp(-0.0001)≈1.0 → gray 255.
+    EXPECT_EQ(img.at<cv::Vec3b>(5, 5)[0], 255);
+    // Single-event pixel: pot=0.15, dt=0 → gray ≈ 38.
+    EXPECT_NEAR(img.at<cv::Vec3b>(10, 10)[0], 255.0 * 0.15, 2.0);
+}
+TEST(TimeSurfaceTest, LinearDecayUnchangedByDefault) {
+    // Default decay stays Linear: hard cut to 0 at the window tail.
+    TimeSurface ts(32, 32, TimeSurface::Channels::Merged, 100000,
+                   TimeSurface::Palette::Gray);
+    EXPECT_EQ(ts.decay(), TimeSurface::Decay::Linear);
+    std::vector<Event> ev;
+    ev.emplace_back(5, 5, 1, 0);
+    ev.emplace_back(10, 10, 1, 100000);  // dt == decay_time_us -> cut to 0
+    ts.process(ev.data(), ev.size());
+    cv::Mat img = ts.render();
+    EXPECT_EQ(img.at<cv::Vec3b>(5, 5)[0], 0);
+    EXPECT_EQ(img.at<cv::Vec3b>(10, 10)[0], 255);
+}
 
 // =========================================================================
 // Phase 10: algo/analytics/ §4.4.1–4.4.7
 // =========================================================================
-
-// --- 4.4.1 ActiveMarker ---
-TEST(ActiveMarkerTest, Construction) {
-    ActiveMarker m(64, 48);
-    EXPECT_EQ(m.width(), 64);
-    EXPECT_EQ(m.height(), 48);
-}
-TEST(ActiveMarkerTest, Params) {
-    ActiveMarker m(32, 32);
-    m.set_window_ms(50.0f);
-    EXPECT_FLOAT_EQ(m.window_ms(), 50.0f);
-    m.set_heatmap_threshold(100);
-    EXPECT_EQ(m.heatmap_threshold(), 100);
-    m.set_enable_freq_detect(true);
-    EXPECT_TRUE(m.enable_freq_detect());
-}
-TEST(ActiveMarkerTest, Process) {
-    ActiveMarker m(32, 32);
-    auto ev = make_events(32, 32, 100);
-    m.process(ev.data(), ev.size());
-    SUCCEED();
-}
 
 // --- 4.4.2 EventToVideo ---
 TEST(EventToVideoTest, Construction) {
@@ -652,104 +745,147 @@ TEST(E2VIDInferenceTest, CropToSensor) {
     EXPECT_EQ(out2.cols, 32);
 }
 
-// --- 4.4.3 FlowStatistics ---
-TEST(FlowStatisticsTest, Construction) {
-    FlowStatistics fs;
-    EXPECT_EQ(fs.output_hz(), 5);
+// --- 4.4.6 AutoBiasController (dual loop: rate band + ON/OFF balance) ---
+namespace {
+// Feed a constant-rate stream for the given duration; returns the CORRECTION
+// commands emitted along the way (home commands excluded — see the homing
+// tests below).
+std::vector<gui_algo::BiasCommand> feed(AutoBiasController& c,
+                                        double on_mev, double off_mev,
+                                        std::int64_t duration_us) {
+    std::vector<gui_algo::BiasCommand> cmds;
+    const std::int64_t step = 1000;  // 1 ms batches
+    const std::uint32_t n_on = static_cast<std::uint32_t>(on_mev * step);
+    const std::uint32_t n_off = static_cast<std::uint32_t>(off_mev * step);
+    std::int64_t t = 0;
+    while (t < duration_us) {
+        t += step;
+        c.accumulate(t, n_on, n_off);
+        const auto cmd = c.update(t);
+        if (cmd.active && !cmd.home) cmds.push_back(cmd);
+    }
+    return cmds;
 }
-TEST(FlowStatisticsTest, Params) {
-    FlowStatistics fs;
-    fs.set_output_hz(10);
-    EXPECT_EQ(fs.output_hz(), 10);
-    fs.set_source(FlowStatistics::Source::Annotated);
-    EXPECT_EQ(fs.source(), FlowStatistics::Source::Annotated);
-}
-TEST(FlowStatisticsTest, AddSamples) {
-    FlowStatistics fs;
-    std::vector<gui_algo::FlowSample> samples;
-    samples.push_back(gui_algo::FlowSample{1.0f, 0.0f, 1.0f, 0.0f}); // perfect match
-    samples.push_back(gui_algo::FlowSample{2.0f, 0.0f, 1.0f, 0.0f}); // off by 1
-    fs.add_samples(samples.data(), samples.size());
-    EXPECT_GT(fs.epe_mean(), 0.0);
-    EXPECT_GE(fs.epe_median(), 0.0);
-}
+} // namespace
 
-// --- 4.4.4 ISIAnalyzer ---
-TEST(ISIAnalyzerTest, Construction) {
-    ISIAnalyzer a(64, 48);
-    EXPECT_EQ(a.bin_count(), 32);  // default bin count
+TEST(AutoBiasControllerTest, RateBandValidation) {
+    AutoBiasController c;  // default band 1..50
+    EXPECT_FLOAT_EQ(c.rate_min_mev(), 1.0f);
+    EXPECT_FLOAT_EQ(c.rate_max_mev(), 50.0f);
+    EXPECT_EQ(c.max_step(), 32);  // fast-convergence default
+    EXPECT_FALSE(c.set_rate_bounds(5.0f, 5.0f));   // lo == hi rejected
+    EXPECT_FALSE(c.set_rate_bounds(8.0f, 4.0f));   // inverted rejected
+    EXPECT_FLOAT_EQ(c.rate_min_mev(), 1.0f);       // previous band kept
+    EXPECT_TRUE(c.set_rate_bounds(2.0f, 20.0f));
+    EXPECT_FLOAT_EQ(c.rate_min_mev(), 2.0f);
+    EXPECT_FLOAT_EQ(c.rate_max_mev(), 20.0f);
+    EXPECT_TRUE(c.set_rate_bounds(0.0f, 5000.0f)); // no artificial ceiling
+    EXPECT_FLOAT_EQ(c.rate_min_mev(), 0.05f);      // min floored, max kept
+    EXPECT_FLOAT_EQ(c.rate_max_mev(), 5000.0f);
 }
-TEST(ISIAnalyzerTest, Params) {
-    ISIAnalyzer a(32, 32);
-    a.set_bin_count(64);
-    EXPECT_EQ(a.bin_count(), 64);
-    a.set_per_pixel(true);
-    EXPECT_TRUE(a.per_pixel());
+TEST(AutoBiasControllerTest, DeadbandIsIdle) {
+    AutoBiasController c;  // band 1..50
+    const auto cmds = feed(c, 3.0, 3.0, 1'000'000);  // in band, balanced
+    EXPECT_TRUE(cmds.empty());
+    EXPECT_NEAR(c.rate_on_mev(), 3.0, 0.2);
+    EXPECT_NEAR(c.rate_off_mev(), 3.0, 0.2);
 }
-TEST(ISIAnalyzerTest, Process) {
-    ISIAnalyzer a(32, 32);
-    auto ev = make_events(32, 32, 50);
-    a.process(ev.data(), ev.size());
-    SUCCEED();
+TEST(AutoBiasControllerTest, HomingWhenSatisfied) {
+    AutoBiasController c;  // band 1..50
+    // In band + balanced → home commands, no correction deltas, spaced by
+    // kHomeIntervalTicks (~1 s at the 30 Hz tick; the test ticks every ms,
+    // so ~30 updates apart).
+    int home_cmds = 0;
+    int last_home_at = -1000;
+    const std::int64_t step = 1000;
+    for (std::int64_t t = step; t <= 2'000'000; t += step) {
+        c.accumulate(t, 3000, 3000);
+        const auto cmd = c.update(t);
+        if (cmd.home) {
+            EXPECT_TRUE(cmd.active);
+            EXPECT_EQ(cmd.delta_on, 0);
+            EXPECT_EQ(cmd.delta_off, 0);
+            ++home_cmds;
+            EXPECT_GT(static_cast<int>(t / step) - last_home_at, 25);
+            last_home_at = static_cast<int>(t / step);
+        }
+    }
+    EXPECT_GE(home_cmds, 50);  // ~1 per second over 2 s
 }
-// Regression: set_bin_count / set_max_isi_ms must preserve the histogram
-// range in µs (previous bug divided by 1000, causing all samples to be
-// dropped and counts() to be all-zero).
-TEST(ISIAnalyzerTest, SetterPreservesRange) {
-    ISIAnalyzer a(32, 32, 32, 100.0f, false);  // max_isi = 100 ms = 100000 us
-    a.set_bin_count(64);
-    // Feed two events 50000 us apart (< 100000 us, must land in a bin).
-    gui_algo::Event ev[2] = {{16, 16, 1, 0}, {16, 16, 1, 50000}};
-    a.process(ev, 2);
-    const auto& counts = a.counts();
-    std::uint64_t total = 0;
-    for (auto c : counts) total += c;
-    EXPECT_GT(total, 0u);  // at least one ISI sample must be counted
+TEST(AutoBiasControllerTest, HomingSuspendsOnViolation) {
+    AutoBiasController c;  // band 1..50
+    // In-band phase homes; the out-of-band phase must NOT home once the
+    // measurement window reflects the new rate (during the first window
+    // span after the transition the window still holds in-band samples —
+    // a home command there is measurement lag, not a logic error).
+    bool homed_after_settled = false;
+    const std::int64_t step = 1000;
+    for (std::int64_t t = step; t <= 3'000'000; t += step) {
+        const bool violating = t > 1'000'000;
+        c.accumulate(t, violating ? 60000 : 3000, violating ? 60000 : 3000);
+        const auto cmd = c.update(t);
+        if (violating && t > 1'500'000 && cmd.home) homed_after_settled = true;
+    }
+    EXPECT_FALSE(homed_after_settled);
 }
-
-// --- 4.4.5 ParticleCounter ---
-TEST(ParticleCounterTest, Construction) {
-    ParticleCounter c(64, 48);
-    EXPECT_EQ(c.width(), 64);
-    EXPECT_EQ(c.height(), 48);
+TEST(AutoBiasControllerTest, HighRateRaisesBoth) {
+    AutoBiasController c;  // band 1..50
+    const auto cmds = feed(c, 40.0, 40.0, 1'000'000);  // 80 Mev/s >> max
+    ASSERT_FALSE(cmds.empty());
+    for (const auto& cmd : cmds) {
+        EXPECT_GT(cmd.delta_on, 0);   // raise both = less sensitive
+        EXPECT_GT(cmd.delta_off, 0);
+    }
 }
-TEST(ParticleCounterTest, Params) {
-    ParticleCounter c(32, 32);
-    c.set_min_particle_size_px(10);
-    EXPECT_EQ(c.min_particle_size_px(), 10);
-    c.set_max_particle_size_px(200);
-    EXPECT_EQ(c.max_particle_size_px(), 200);
+TEST(AutoBiasControllerTest, LowRateLowersBoth) {
+    AutoBiasController c;  // band 1..10
+    const auto cmds = feed(c, 0.05, 0.05, 1'000'000);  // 0.1 Mev/s < min
+    ASSERT_FALSE(cmds.empty());
+    for (const auto& cmd : cmds) {
+        EXPECT_LT(cmd.delta_on, 0);   // lower both = more sensitive
+        EXPECT_LT(cmd.delta_off, 0);
+    }
 }
-TEST(ParticleCounterTest, InitialCount) {
-    ParticleCounter c(32, 32);
-    EXPECT_EQ(c.cumulative_count(), 0u);
+TEST(AutoBiasControllerTest, BalanceRaisesOnlyDominantPolarity) {
+    AutoBiasController c;  // band 1..10
+    // Total 6 Mev/s (in band), heavily ON-skewed: b = 0.67 > tol.
+    const auto cmds = feed(c, 5.0, 1.0, 1'000'000);
+    ASSERT_FALSE(cmds.empty());
+    for (const auto& cmd : cmds) {
+        EXPECT_GT(cmd.delta_on, 0);    // gate the dominant ON side
+        EXPECT_EQ(cmd.delta_off, 0);   // leave the OFF side untouched
+    }
 }
-
-// --- 4.4.6 AutoBiasController ---
-TEST(AutoBiasControllerTest, Construction) {
+TEST(AutoBiasControllerTest, HoldAfterAction) {
+    AutoBiasController c;  // band 1..50
+    const auto cmds = feed(c, 40.0, 40.0, 600'000);  // 80 Mev/s >> max
+    ASSERT_GE(cmds.size(), 1u);
+    // Each action flushes the measurement window (all pre-action samples
+    // are stale), so consecutive commands are spaced by the 200 ms refill
+    // at minimum — over 600 ms at most ~2 actions, never back-to-back.
+    EXPECT_LE(cmds.size(), 3u);
+}
+TEST(AutoBiasControllerTest, IntegerDeltasAndStepCap) {
+    AutoBiasController c(1.0f, 10.0f, 4);  // max_step 4
+    const auto cmds = feed(c, 50.0, 50.0, 500'000);
+    ASSERT_FALSE(cmds.empty());
+    for (const auto& cmd : cmds) {
+        EXPECT_LE(cmd.delta_on, 4);
+        EXPECT_LE(cmd.delta_off, 4);
+    }
+}
+TEST(AutoBiasControllerTest, ColdWindowIsIdle) {
     AutoBiasController c;
-    EXPECT_FLOAT_EQ(c.target_event_rate_mev(), 5.0f);
-    EXPECT_FLOAT_EQ(c.kp(), 0.5f);
-}
-TEST(AutoBiasControllerTest, Params) {
-    AutoBiasController c;
-    c.set_target_event_rate_mev(10.0f);
-    EXPECT_FLOAT_EQ(c.target_event_rate_mev(), 10.0f);
-    c.set_gains(0.3f, 0.02f, 0.01f);
-    EXPECT_FLOAT_EQ(c.kp(), 0.3f);
-    EXPECT_FLOAT_EQ(c.ki(), 0.02f);
-    EXPECT_FLOAT_EQ(c.kd(), 0.01f);
-}
-TEST(AutoBiasControllerTest, Update) {
-    AutoBiasController c(5.0f);
-    auto cmd = c.update(3.0, 1000000); // measured 3 Mev/s, target 5
-    EXPECT_NE(cmd.delta_diff, 0.0f); // should have some correction
+    c.accumulate(1000, 100000, 100000);  // single batch, window not ready
+    EXPECT_FALSE(c.window_ready());
+    EXPECT_FALSE(c.update(1000).active);
 }
 TEST(AutoBiasControllerTest, Reset) {
-    AutoBiasController c(5.0f);
-    c.update(3.0, 1000000);
+    AutoBiasController c;
+    feed(c, 20.0, 20.0, 400'000);
     c.reset();
-    EXPECT_DOUBLE_EQ(c.integral(), 0.0);
+    EXPECT_TRUE(c.rate_on_mev() == 0.0 && c.rate_off_mev() == 0.0);
+    EXPECT_FALSE(c.window_ready());
 }
 
 // --- 4.4.7 FreqDetector ---
@@ -777,8 +913,115 @@ TEST(FreqDetectorTest, ProcessAndAnalyze) {
     auto ev = make_events(32, 32, 100);
     d.process(ev.data(), ev.size());
     auto sources = d.analyze();
-    // May or may not find light sources.
-    SUCCEED();
+    // Still in the initialization phase -> no results yet.
+    EXPECT_TRUE(sources.empty());
+}
+
+// Blinking LED covering the 3x3 block around (16, 16) (a real LED spans
+// several pixels, and clusters below min_cc_area=3 are skipped): one event
+// every 5000 us -> event frequency 200 Hz, physical blink frequency 100 Hz.
+static std::vector<Event> make_blinking_led(std::size_t count,
+                                            Metavision::timestamp dt_us = 5000,
+                                            Metavision::timestamp t0 = 0) {
+    std::vector<Event> ev;
+    ev.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const uint16_t x = static_cast<uint16_t>(15 + i % 3);
+        const uint16_t y = static_cast<uint16_t>(15 + (i / 3) % 3);
+        ev.emplace_back(x, y, static_cast<uint8_t>(i & 1),
+                        t0 + static_cast<Metavision::timestamp>(i) * dt_us);
+    }
+    return ev;
+}
+
+TEST(FreqDetectorTest, InitPhaseGatesAnalyze) {
+    FreqDetector d(32, 32);
+    // 3 s of stream (600 events at 5 ms): below first_analysis_s (5 s).
+    auto ev = make_blinking_led(600, 5000, 0);
+    d.process(ev.data(), ev.size());
+    EXPECT_EQ(d.phase(), FreqDetector::Phase::Initializing);
+    EXPECT_GT(d.init_remaining_s(), 0.0f);
+    EXPECT_TRUE(d.analyze().empty());
+    // Cross the warm-up threshold (5 s).
+    auto ev2 = make_blinking_led(500, 5000, 3000000);
+    d.process(ev2.data(), ev2.size());
+    EXPECT_EQ(d.phase(), FreqDetector::Phase::Running);
+    EXPECT_FLOAT_EQ(d.init_remaining_s(), 0.0f);
+    auto sources = d.analyze();
+    ASSERT_EQ(sources.size(), 1u);
+    // Bounding box covers the blinking pixel.
+    EXPECT_LE(sources[0].u0, 16);
+    EXPECT_LE(sources[0].v0, 16);
+    EXPECT_GT(sources[0].u0 + sources[0].w, 16);
+    EXPECT_GT(sources[0].v0 + sources[0].h, 16);
+    // Event frequency 200 Hz (blink 100 Hz), within the DFT resolution.
+    EXPECT_NEAR(sources[0].event_freq_hz, 200.0f, 10.0f);
+    EXPECT_NEAR(sources[0].blink_freq_hz, 100.0f, 5.0f);
+}
+
+TEST(FreqDetectorTest, FreezesAfterMaxDuration) {
+    FreqDetector d(32, 32);
+    // Run past max_duration_s (20 s): the last computed result is frozen.
+    auto ev = make_blinking_led(4300, 5000, 0);  // spans 0..21.5 s
+    d.process(ev.data(), ev.size());
+    ASSERT_EQ(d.phase(), FreqDetector::Phase::Running);
+    auto frozen = d.analyze();
+    ASSERT_EQ(frozen.size(), 1u);
+    // Feed a different pattern after the freeze: the result must not change.
+    std::vector<Event> other;
+    for (int i = 0; i < 500; ++i) {
+        other.emplace_back(2, 2, 1, 22000000 + i * 2500);
+    }
+    d.process(other.data(), other.size());
+    auto after = d.analyze();
+    ASSERT_EQ(after.size(), frozen.size());
+    EXPECT_EQ(after[0].u0, frozen[0].u0);
+    EXPECT_NEAR(after[0].blink_freq_hz, frozen[0].blink_freq_hz, 1e-3f);
+}
+
+TEST(FreqDetectorTest, MinTotalEventsGate) {
+    FreqDetector d(32, 32);
+    // 6 s of stream but only 50 events: below the 100-event guard.
+    auto ev = make_blinking_led(50, 120000, 0);
+    d.process(ev.data(), ev.size());
+    EXPECT_EQ(d.phase(), FreqDetector::Phase::Initializing);
+    EXPECT_TRUE(d.analyze().empty());
+}
+
+TEST(FreqDetectorTest, BufferCapEvictsOldestAndUndoesHeatmap) {
+    FreqDetector d(32, 32);
+    d.set_first_analysis_s(0.5f);   // min clamp
+    d.set_heatmap_threshold(1);
+    d.set_min_cc_area(3);
+    // Tiny cap: at most 150 of the 400 events below are retained.
+    d.set_max_buffer_events(150);
+    // LED A around (5..7): 200 events over 0..1 s, then LED B around
+    // (20..22): 200 events over 1..2 s. The cap keeps only the tail -> all
+    // of A is evicted (its heatmap counts must be undone) and only B forms
+    // a cluster.
+    std::vector<Event> ev;
+    for (int i = 0; i < 200; ++i)
+        ev.emplace_back(5 + i % 3, 5 + (i / 3) % 3, static_cast<uint8_t>(i & 1),
+                        static_cast<Metavision::timestamp>(i * 5000));
+    for (int i = 0; i < 200; ++i)
+        ev.emplace_back(20 + i % 3, 20 + (i / 3) % 3, static_cast<uint8_t>(i & 1),
+                        static_cast<Metavision::timestamp>(1000000 + i * 5000));
+    d.process(ev.data(), ev.size());
+    ASSERT_EQ(d.phase(), FreqDetector::Phase::Running);
+    auto sources = d.analyze();
+    ASSERT_EQ(sources.size(), 1u);
+    EXPECT_GE(sources[0].u0, 19);
+    EXPECT_LE(sources[0].u0, 23);
+}
+
+TEST(FreqDetectorTest, ResetRestartsInitPhase) {
+    FreqDetector d(32, 32);
+    auto ev = make_blinking_led(1200, 5000, 0);  // 6 s > 5 s warm-up
+    d.process(ev.data(), ev.size());
+    ASSERT_EQ(d.phase(), FreqDetector::Phase::Running);
+    d.reset();
+    EXPECT_EQ(d.phase(), FreqDetector::Phase::Initializing);
+    EXPECT_TRUE(d.analyze().empty());
 }
 
 // --- 4.4.8 SensorSelfTest ---
@@ -923,4 +1166,269 @@ TEST(SensorSelfTestTest, MultiplePixelsStats) {
     // Sorted intervals: [100, 200]. median = intervals[1] = 200.
     EXPECT_EQ(stats.median_us, 200.0);
     EXPECT_EQ(stats.bad_pixels, 14u);  // 16 - 2 triggered
+}
+
+// ---------------------------------------------------------------------------
+// DenseOpticalFlow (design §4.3.9b) — synthetic moving-line / moving-point
+// scenes verify the three dense flow modes recover the known velocity.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A vertical line (height h) moving right at vx px/s: one event per pixel of
+// the line every step_us µs, for n_steps steps. Returns sorted-by-t events.
+std::vector<gui_algo::Event> make_moving_line(int start_x, int h,
+                                              double vx_px_s,
+                                              int n_steps, double step_us) {
+    std::vector<gui_algo::Event> evs;
+    const double vx_us = vx_px_s * 1e-6;  // px/µs
+    for (int k = 0; k < n_steps; ++k) {
+        const Metavision::timestamp t = static_cast<Metavision::timestamp>(
+            std::llround(k * step_us));
+        const int x = static_cast<int>(std::lround(start_x + vx_us * t));
+        for (int y = 0; y < h; ++y) {
+            gui_algo::Event e;
+            e.x = x; e.y = y; e.p = 1; e.t = t;
+            evs.push_back(e);
+        }
+    }
+    return evs;
+}
+
+// A single point moving at (vx, vy) px/s: one event every step_us µs.
+std::vector<gui_algo::Event> make_moving_point(double start_x, double start_y,
+                                               double vx_px_s, double vy_px_s,
+                                               int n_steps, double step_us) {
+    std::vector<gui_algo::Event> evs;
+    const double vx_us = vx_px_s * 1e-6, vy_us = vy_px_s * 1e-6;
+    for (int k = 0; k < n_steps; ++k) {
+        const Metavision::timestamp t = static_cast<Metavision::timestamp>(
+            std::llround(k * step_us));
+        gui_algo::Event e;
+        e.x = static_cast<int>(std::lround(start_x + vx_us * t));
+        e.y = static_cast<int>(std::lround(start_y + vy_us * t));
+        e.p = 1; e.t = t;
+        evs.push_back(e);
+    }
+    return evs;
+}
+
+} // namespace
+
+TEST(DenseOpticalFlowTest, Construction) {
+    gui_algo::DenseOpticalFlow f(64, 48);
+    EXPECT_EQ(f.mode(), gui_algo::DenseOpticalFlow::Mode::PlaneFitting);
+    EXPECT_EQ(f.width(), 64);
+    EXPECT_EQ(f.height(), 48);
+    f.set_mode(gui_algo::DenseOpticalFlow::Mode::TripletMatching);
+    EXPECT_EQ(f.mode(), gui_algo::DenseOpticalFlow::Mode::TripletMatching);
+}
+
+TEST(DenseOpticalFlowTest, NoEventsProducesEmptyFlow) {
+    gui_algo::DenseOpticalFlow f(32, 32);
+    cv::Mat flow, conf;
+    f.get_flow(flow, conf);
+    EXPECT_EQ(flow.rows, 32);
+    EXPECT_EQ(flow.cols, 32);
+    EXPECT_EQ(cv::countNonZero(conf), 0);
+}
+
+TEST(DenseOpticalFlowTest, PlaneFittingRecoversHorizontalMotion) {
+    constexpr int W = 64, H = 32;
+    gui_algo::DenseOpticalFlow f(W, H, gui_algo::DenseOpticalFlow::Mode::PlaneFitting);
+    f.set_time_window_us(10000);
+    f.set_max_events(200000);
+    f.set_max_velocity_px_s(10000);
+    // Vertical line at x=8 → 28 over 10 ms, 2000 px/s.
+    auto evs = make_moving_line(8, H - 4, 2000.0, 2000, 5.0);
+    f.process(evs.data(), evs.data() + evs.size());
+
+    cv::Mat flow, conf;
+    f.get_flow(flow, conf);
+    // Interior cell of the trajectory (x=18, y=16).
+    const cv::Vec2f v = flow.at<cv::Vec2f>(16, 18);
+    EXPECT_GT(conf.at<float>(16, 18), 0.0f);
+    EXPECT_NEAR(v[0], 2000.0, 400.0) << "normal flow should recover vx";
+    EXPECT_NEAR(v[1], 0.0, 200.0) << "no vertical motion expected";
+}
+
+TEST(DenseOpticalFlowTest, TimeGradientRecoversHorizontalMotion) {
+    constexpr int W = 64, H = 32;
+    gui_algo::DenseOpticalFlow f(W, H, gui_algo::DenseOpticalFlow::Mode::TimeGradient);
+    f.set_time_window_us(10000);
+    f.set_max_events(200000);
+    f.set_max_velocity_px_s(10000);
+    auto evs = make_moving_line(8, H - 4, 2000.0, 2000, 5.0);
+    f.process(evs.data(), evs.data() + evs.size());
+
+    cv::Mat flow, conf;
+    f.get_flow(flow, conf);
+    const cv::Vec2f v = flow.at<cv::Vec2f>(16, 18);
+    EXPECT_GT(conf.at<float>(16, 18), 0.0f);
+    EXPECT_NEAR(v[0], 2000.0, 600.0);
+    EXPECT_NEAR(v[1], 0.0, 300.0);
+}
+
+TEST(DenseOpticalFlowTest, TripletMatchingRecoversDiagonalMotion) {
+    constexpr int W = 128, H = 64;
+    gui_algo::DenseOpticalFlow f(W, H, gui_algo::DenseOpticalFlow::Mode::TripletMatching);
+    f.set_time_window_us(10000);
+    f.set_max_velocity_px_s(20000);
+    // Point from (30,20) moving (5000, 3000) px/s, event every 100 µs (100
+    // events over 10 ms → well-separated triplets, exact velocity).
+    auto evs = make_moving_point(30.0, 20.0, 5000.0, 3000.0, 100, 100.0);
+    f.process(evs.data(), evs.data() + evs.size());
+
+    cv::Mat flow, conf;
+    f.get_flow(flow, conf);
+    // A cell on the trajectory (near the middle).
+    const cv::Vec2f v = flow.at<cv::Vec2f>(35, 55);
+    EXPECT_GT(conf.at<float>(35, 55), 0.0f);
+    EXPECT_NEAR(v[0], 5000.0, 1500.0) << "triplet flow should recover vx";
+    EXPECT_NEAR(v[1], 3000.0, 1200.0) << "triplet flow should recover vy";
+}
+
+TEST(DenseOpticalFlowTest, ResetClearsState) {
+    gui_algo::DenseOpticalFlow f(32, 32);
+    auto evs = make_moving_line(4, 8, 1000.0, 200, 5.0);
+    f.process(evs.data(), evs.data() + evs.size());
+    f.reset();
+    cv::Mat flow, conf;
+    f.get_flow(flow, conf);
+    EXPECT_EQ(cv::countNonZero(conf), 0);
+}
+
+// ---------------------------------------------------------------------------
+// FrequencyMap (design §4.3.x) — synthetic blinking blobs verify per-pixel
+// frequency estimation and frequency clustering.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Appends `n_cycles` ON/OFF pairs for an (x0,y0)-(x0+sw-1,y0+sh-1) blob that
+// blinks at `freq_hz` (full period = 1/freq, half period between polarities).
+// Events are emitted in non-decreasing timestamp order.
+void add_blinking_blob(std::vector<gui_algo::Event>& evs,
+                       int x0, int y0, int sw, int sh,
+                       double freq_hz, int n_cycles) {
+    const double half_us = 0.5e6 / freq_hz;
+    for (int k = 0; k < n_cycles; ++k) {
+        const Metavision::timestamp t_on = static_cast<Metavision::timestamp>(
+            std::llround(k * 2.0 * half_us));
+        const Metavision::timestamp t_off = static_cast<Metavision::timestamp>(
+            std::llround(t_on + half_us));
+        for (int dy = 0; dy < sh; ++dy) {
+            for (int dx = 0; dx < sw; ++dx) {
+                gui_algo::Event on;
+                on.x = x0 + dx; on.y = y0 + dy; on.p = 1; on.t = t_on;
+                evs.push_back(on);
+                gui_algo::Event off;
+                off.x = x0 + dx; off.y = y0 + dy; off.p = 0; off.t = t_off;
+                evs.push_back(off);
+            }
+        }
+    }
+}
+
+} // namespace
+
+TEST(FrequencyMapTest, Construction) {
+    gui_algo::FrequencyMap fm(32, 32);
+    EXPECT_EQ(fm.width(), 32);
+    EXPECT_EQ(fm.height(), 32);
+    EXPECT_TRUE(fm.sources().empty());
+}
+
+TEST(FrequencyMapTest, DetectsSingleBlinkingBlob) {
+    constexpr int W = 64, H = 64;
+    gui_algo::FrequencyMap fm(W, H);
+    gui_algo::FrequencyMapParams p;
+    p.frequency_filter_length = 7;
+    p.min_cluster_size = 20;
+    fm.set_params(p);
+
+    std::vector<gui_algo::Event> evs;
+    add_blinking_blob(evs, 20, 20, 5, 5, 100.0, 20);  // 5×5 @ 100 Hz
+    fm.process(evs.data(), evs.data() + evs.size());
+    fm.analyze();
+
+    // Per-pixel frequency at the blob centre ≈ 100 Hz.
+    EXPECT_NEAR(fm.frequency_hz().at<float>(22, 22), 100.0f, 5.0f);
+    // One clustered source with the expected centroid / frequency / area.
+    ASSERT_EQ(fm.sources().size(), 1u);
+    EXPECT_NEAR(fm.sources()[0].x, 22.0f, 1.0f);
+    EXPECT_NEAR(fm.sources()[0].y, 22.0f, 1.0f);
+    EXPECT_NEAR(fm.sources()[0].frequency_hz, 100.0f, 5.0f);
+    EXPECT_EQ(fm.sources()[0].area, 25);
+}
+
+TEST(FrequencyMapTest, ClustersTwoDistinctFrequencies) {
+    constexpr int W = 128, H = 64;
+    gui_algo::FrequencyMap fm(W, H);
+    gui_algo::FrequencyMapParams p;
+    p.frequency_filter_length = 7;
+    p.min_cluster_size = 10;
+    p.max_cluster_frequency_diff = 10.0f;
+    fm.set_params(p);
+
+    std::vector<gui_algo::Event> evs;
+    add_blinking_blob(evs, 20, 20, 4, 4, 80.0, 20);   // 80 Hz
+    add_blinking_blob(evs, 40, 20, 4, 4, 100.0, 20);  // 100 Hz (gap ≥ 2 px)
+    fm.process(evs.data(), evs.data() + evs.size());
+    fm.analyze();
+
+    ASSERT_EQ(fm.sources().size(), 2u);
+    // 80 Hz source first (lower x), 100 Hz second.
+    EXPECT_NEAR(fm.sources()[0].frequency_hz, 80.0f, 5.0f);
+    EXPECT_NEAR(fm.sources()[1].frequency_hz, 100.0f, 5.0f);
+}
+
+TEST(FrequencyMapTest, NoiseProducesNoSource) {
+    constexpr int W = 64, H = 64;
+    gui_algo::FrequencyMap fm(W, H);
+    gui_algo::FrequencyMapParams p;
+    p.frequency_filter_length = 7;
+    fm.set_params(p);
+
+    // Random single events: no pixel repeats at a stable period.
+    std::vector<gui_algo::Event> evs;
+    unsigned seed = 7;
+    for (int k = 0; k < 2000; ++k) {
+        seed = seed * 1103515245u + 12345u;
+        gui_algo::Event e;
+        e.x = static_cast<int>((seed >> 16) % W);
+        seed = seed * 1103515245u + 12345u;
+        e.y = static_cast<int>((seed >> 16) % H);
+        e.p = static_cast<short>((seed >> 16) & 1);
+        e.t = k * 100;  // 100 µs apart, random pixel/polarity
+        evs.push_back(e);
+    }
+    fm.process(evs.data(), evs.data() + evs.size());
+    fm.analyze();
+    EXPECT_TRUE(fm.sources().empty());
+}
+
+TEST(FrequencyMapTest, StaleFrequenciesAreDropped) {
+    constexpr int W = 64, H = 64;
+    gui_algo::FrequencyMap fm(W, H);
+    gui_algo::FrequencyMapParams p;
+    p.frequency_filter_length = 7;
+    p.min_cluster_size = 20;
+    p.stale_us = 100000;  // 100 ms
+    fm.set_params(p);
+
+    std::vector<gui_algo::Event> evs;
+    add_blinking_blob(evs, 20, 20, 5, 5, 100.0, 10);  // 100 ms of blinking
+    fm.process(evs.data(), evs.data() + evs.size());
+    fm.analyze();
+    EXPECT_NEAR(fm.frequency_hz().at<float>(22, 22), 100.0f, 5.0f);
+
+    // Advance the stream past the stale threshold with events elsewhere.
+    const Metavision::timestamp later = evs.back().t + p.stale_us + 1000;
+    gui_algo::Event far;
+    far.x = 0; far.y = 0; far.p = 1; far.t = later;
+    fm.process(&far, &far + 1);
+    fm.analyze();
+    EXPECT_EQ(fm.frequency_hz().at<float>(22, 22), 0.0f);
+    EXPECT_TRUE(fm.sources().empty());
 }

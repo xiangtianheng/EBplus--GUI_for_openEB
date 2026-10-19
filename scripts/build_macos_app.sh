@@ -12,6 +12,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_NAME="${APP_NAME:-EBplus}"
 ARCH="${ARCH:-arm64}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+BUILD_JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-$(sysctl -n hw.logicalcpu)}"
 BUILD_ROOT="${BUILD_ROOT:-$REPO_ROOT/build}"
 OPENEB_BUILD_DIR="${OPENEB_BUILD_DIR:-$BUILD_ROOT/openeb-macos-$ARCH}"
 OPENEB_INSTALL_PREFIX="${OPENEB_INSTALL_PREFIX:-$BUILD_ROOT/openeb-install}"
@@ -478,7 +479,7 @@ cmake -S "$REPO_ROOT/openeb" -B "$OPENEB_BUILD_DIR" \
     -DCMAKE_PREFIX_PATH="$OPENEB_PREFIX_PATH"
 
 log "Building and installing vendored OpenEB"
-cmake --build "$OPENEB_BUILD_DIR" --target install --parallel
+cmake --build "$OPENEB_BUILD_DIR" --target install --parallel "$BUILD_JOBS"
 
 log "Configuring EBplus"
 cmake -S "$REPO_ROOT" -B "$APP_BUILD_DIR" \
@@ -489,7 +490,7 @@ cmake -S "$REPO_ROOT" -B "$APP_BUILD_DIR" \
     -DCMAKE_PREFIX_PATH="$COMMON_PREFIX_PATH"
 
 log "Building EBplus.app"
-cmake --build "$APP_BUILD_DIR" --target gui_for_openeb --parallel
+cmake --build "$APP_BUILD_DIR" --target gui_for_openeb --parallel "$BUILD_JOBS"
 
 APP_BUNDLE="$APP_BUILD_DIR/gui/$APP_NAME.app"
 if [[ ! -d "$APP_BUNDLE" ]]; then

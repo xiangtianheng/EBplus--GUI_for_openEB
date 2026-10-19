@@ -5,15 +5,10 @@
 #include <mutex>
 #include <sstream>
 
-#include <metavision/sdk/core/algorithms/event_rescaler_algorithm.h>
 #include <metavision/sdk/core/algorithms/flip_x_algorithm.h>
 #include <metavision/sdk/core/algorithms/flip_y_algorithm.h>
 #include <metavision/sdk/core/algorithms/polarity_filter_algorithm.h>
 #include <metavision/sdk/core/algorithms/polarity_inverter_algorithm.h>
-#include <metavision/sdk/core/algorithms/rotate_events_algorithm.h>
-#include <metavision/sdk/core/algorithms/transpose_events_algorithm.h>
-
-#include <metavision/sdk/core/algorithms/roi_filter_algorithm.h>
 
 namespace gui {
 
@@ -102,6 +97,7 @@ public:
         return false;
     }
     std::string name() const override { return "flip_x"; }
+    bool is_geometry() const override { return true; }
 private:
     Metavision::FlipXAlgorithm algo_;
 };
@@ -124,159 +120,21 @@ public:
         return false;
     }
     std::string name() const override { return "flip_y"; }
+    bool is_geometry() const override { return true; }
 private:
     Metavision::FlipYAlgorithm algo_;
 };
 
-class RotateStage : public FilterStage {
-public:
-    RotateStage() : algo_(0, 0, 0.0f) {}
-    void process(const Metavision::EventCD* b, const Metavision::EventCD* e,
-                 std::vector<Metavision::EventCD>& out) override {
-        if (!enabled_) return;
-        if (orthogonal_) {
-            // For 90/180/270 we apply the transform directly so the output
-            // coordinates are mathematically correct. RotateEventsAlgorithm
-            // rotates about ((W)/2, (H)/2) and bounds-checks against the
-            // SAME [0,W-1]x[0,H-1] box, which for 90/270 on non-square
-            // sensors both drops ~45% of events AND mis-positions the
-            // survivors. Direct math drops the events that cannot fit (x>=H
-            // or y>=W after the swap) but positions the rest correctly.
-            const std::int16_t W = width_minus_one_;
-            const std::int16_t H = height_minus_one_;
-            for (auto it = b; it != e; ++it) {
-                Metavision::EventCD ev = *it;
-                switch (angle_) {
-                    case 90:  { std::int16_t nx = static_cast<std::int16_t>(H - ev.y);
-                                std::int16_t ny = ev.x;
-                                if (nx < 0 || ny < 0 || ny > W) continue;
-                                ev.x = nx; ev.y = ny; break; }
-                    case 180: { ev.x = static_cast<std::int16_t>(W - ev.x);
-                                ev.y = static_cast<std::int16_t>(H - ev.y); break; }
-                    case 270: { std::int16_t nx = ev.y;
-                                std::int16_t ny = static_cast<std::int16_t>(W - ev.x);
-                                if (nx < 0 || nx > H || ny < 0 || ny > W) continue;
-                                ev.x = nx; ev.y = ny; break; }
-                    default: break; // 0° = identity
-                }
-                out.push_back(ev);
-            }
-        } else {
-            algo_.process_events(b, e, std::back_inserter(out));
-        }
-    }
-    bool set_param(const std::string& k, const std::string& v) override {
-        if (k == "rotation") {
-            // Accept degrees (0/90/180/270) or a numeric radian. Orthogonal
-            // angles take the direct-math fast path; arbitrary radians go
-            // through RotateEventsAlgorithm (which clips to the original
-            // frame — acceptable for non-integer angles).
-            if (v == "0")      { angle_ = 0;   orthogonal_ = true;  return true; }
-            if (v == "90")     { angle_ = 90;  orthogonal_ = true;  return true; }
-            if (v == "180")    { angle_ = 180; orthogonal_ = true;  return true; }
-            if (v == "270")    { angle_ = 270; orthogonal_ = true;  return true; }
-            float rad = 0;
-            if (!parse(v, rad)) return false;
-            rotation_ = rad;
-            orthogonal_ = false;
-            rebuild();
-            return true;
-        }
-        if (k == "width_minus_one") {
-            std::int16_t w = 0;
-            if (!parse(v, w)) return false;
-            width_minus_one_ = w;
-            rebuild();
-            return true;
-        }
-        if (k == "height_minus_one") {
-            std::int16_t h = 0;
-            if (!parse(v, h)) return false;
-            height_minus_one_ = h;
-            rebuild();
-            return true;
-        }
-        return false;
-    }
-    std::string name() const override { return "rotate"; }
-private:
-    // RotateEventsAlgorithm is only used for arbitrary (non-orthogonal) angles.
-    void rebuild() {
-        if (orthogonal_) return;
-        algo_ = Metavision::RotateEventsAlgorithm(width_minus_one_, height_minus_one_, rotation_);
-    }
-    int angle_{0};
-    bool orthogonal_{true};
-    std::int16_t width_minus_one_{0};
-    std::int16_t height_minus_one_{0};
-    float rotation_{0.0f};
-    Metavision::RotateEventsAlgorithm algo_;
-};
-
-class TransposeStage : public FilterStage {
-public:
-    void process(const Metavision::EventCD* b, const Metavision::EventCD* e,
-                 std::vector<Metavision::EventCD>& out) override {
-        if (!enabled_) return;
-        algo_.process_events(b, e, std::back_inserter(out));
-    }
-    bool set_param(const std::string&, const std::string&) override { return false; }
-    std::string name() const override { return "transpose"; }
-private:
-    Metavision::TransposeEventsAlgorithm algo_;
-};
-
-class RescaleStage : public FilterStage {
-public:
-    RescaleStage() { rebuild(); }
-    void process(const Metavision::EventCD* b, const Metavision::EventCD* e,
-                 std::vector<Metavision::EventCD>& out) override {
-        if (!enabled_ || !algo_) return;
-        algo_->process_events(b, e, std::back_inserter(out));
-    }
-    bool set_param(const std::string& k, const std::string& v) override {
-        float f = 0;
-        if (!parse(v, f) || f <= 0) return false;
-        if (k == "scale_width")  { sw_ = f; rebuild(); return true; }
-        if (k == "scale_height") { sh_ = f; rebuild(); return true; }
-        return false;
-    }
-    std::string name() const override { return "rescale"; }
-private:
-    void rebuild() { algo_ = std::make_unique<Metavision::EventRescalerAlgorithm>(sw_, sh_); }
-    float sw_{1.0f}, sh_{1.0f};
-    std::unique_ptr<Metavision::EventRescalerAlgorithm> algo_;
-};
-
-class RoiFilterStage : public FilterStage {
-public:
-    RoiFilterStage() : algo_(0, 0, 0, 0) {}
-    void process(const Metavision::EventCD* b, const Metavision::EventCD* e,
-                 std::vector<Metavision::EventCD>& out) override {
-        if (!enabled_) return;
-        algo_.process_events(b, e, std::back_inserter(out));
-    }
-    bool set_param(const std::string& k, const std::string& v) override {
-        if (k == "output_relative_coordinates") {
-            rel_ = (v == "1" || v == "true" || v == "True" || v == "on" || v == "yes");
-            rebuild();
-            return true;
-        }
-        int n = 0;
-        if (!parse(v, n)) return false;
-        if (k == "x0") { x0_ = n; rebuild(); return true; }
-        if (k == "y0") { y0_ = n; rebuild(); return true; }
-        if (k == "x1") { x1_ = n; rebuild(); return true; }
-        if (k == "y1") { y1_ = n; rebuild(); return true; }
-        return false;
-    }
-    std::string name() const override { return "roi_filter"; }
-private:
-    void rebuild() { algo_ = Metavision::RoiFilterAlgorithm(x0_, y0_, x1_, y1_, rel_); }
-    int x0_{0}, y0_{0}, x1_{0}, y1_{0};
-    bool rel_{false};
-    Metavision::RoiFilterAlgorithm algo_;
-};
+// Phase 2.6 debug D-6: RoiFilterStage was deleted (superseded by the
+// unified ROI — see the FilterChain ctor).
+//
+// RotateStage / TransposeStage / RescaleStage were deleted (2026-08-18):
+// they change event coordinates without propagating the new frame geometry
+// to the W×H downstream buffers (live display time surface, algorithm
+// instances), causing out-of-bounds writes → heap corruption / delayed
+// segfaults (munmap_chunk / corrupted size / double free / unaligned
+// tcache, depending on which heap metadata got clobbered). Old configs
+// referencing them hit the unknown-stage warning path, like roi_filter.
 
 } // namespace
 
@@ -289,26 +147,25 @@ FilterChain::FilterChain() {
     add("polarity_invert", std::make_unique<PolarityInvertStage>());
     add("flip_x", std::make_unique<FlipXStage>(width_));
     add("flip_y", std::make_unique<FlipYStage>(height_));
-    add("rotate", std::make_unique<RotateStage>());
-    add("transpose", std::make_unique<TransposeStage>());
-    add("rescale", std::make_unique<RescaleStage>());
-    add("roi_filter", std::make_unique<RoiFilterStage>());
+    // Phase 2.6 debug D-6: the roi_filter stage was deleted (superseded by
+    // the unified ROI). 2026-08-18: rotate / transpose / rescale were deleted
+    // (coordinate-changing stages without geometry propagation — see the
+    // note above). Old configs referencing them hit the unknown-stage
+    // warning path.
 }
 
 void FilterChain::set_geometry(int width, int height) {
     std::lock_guard<std::mutex> lk(chain_mutex());
     width_ = width;
     height_ = height;
-    // Rebuild geometry-dependent stages. RotateStage needs both dimensions
-    // (it bounds-checks rotated coordinates against width/height-1).
+    // Rebuild geometry-dependent stages (the flips mirror coordinates within
+    // [0,W-1]x[0,H-1], so they must track the sensor dims).
     auto apply = [this](const std::string& name, const std::string& key, const std::string& val) {
         auto it = stages_.find(name);
         if (it != stages_.end()) it->second->set_param(key, val);
     };
     apply("flip_x", "width_minus_one", std::to_string(width - 1));
     apply("flip_y", "height_minus_one", std::to_string(height - 1));
-    apply("rotate", "width_minus_one", std::to_string(width - 1));
-    apply("rotate", "height_minus_one", std::to_string(height - 1));
 }
 
 FilterStage* FilterChain::stage(const std::string& name) {
@@ -336,33 +193,59 @@ bool FilterChain::is_stage_enabled(const std::string& name) const {
     return it != stages_.end() && it->second->enabled();
 }
 
-std::vector<std::string> FilterChain::stage_names() const {
-    return order_;
-}
-
 void FilterChain::process(const Metavision::EventCD* begin,
                           const Metavision::EventCD* end,
                           std::vector<Metavision::EventCD>& out) {
+    process_group(begin, end, out, Group::All);
+}
+
+void FilterChain::process_value(const Metavision::EventCD* begin,
+                                const Metavision::EventCD* end,
+                                std::vector<Metavision::EventCD>& out) {
+    process_group(begin, end, out, Group::ValueOnly);
+}
+
+void FilterChain::process_geometry(const Metavision::EventCD* begin,
+                                   const Metavision::EventCD* end,
+                                   std::vector<Metavision::EventCD>& out) {
+    process_group(begin, end, out, Group::GeometryOnly);
+}
+
+void FilterChain::process_group(const Metavision::EventCD* begin,
+                                const Metavision::EventCD* end,
+                                std::vector<Metavision::EventCD>& out,
+                                Group group) {
     std::lock_guard<std::mutex> lk(chain_mutex());
     out.clear();
-    // Start from the input; if no stage is enabled, just copy.
-    std::vector<Metavision::EventCD> cur(begin, end);
-    std::vector<Metavision::EventCD> next;
-    next.reserve(cur.size());
+    // Reuse the scratch buffers (safe under chain_mutex_) instead of
+    // allocating cur/next per call and per stage — steady-state zero
+    // allocation on the hot SDK-thread path.
+    scratch_in_.clear();
+    scratch_in_.insert(scratch_in_.end(), begin, end);
+    scratch_out_.clear();
+    scratch_out_.reserve(std::max(scratch_out_.capacity(), scratch_in_.size()));
     for (const auto& name : order_) {
         auto* s = stages_[name].get();
         if (!s || !s->enabled()) continue;
-        next.clear();
-        s->process(cur.data(), cur.data() + cur.size(), next);
-        cur.swap(next);
+        if (group == Group::ValueOnly && s->is_geometry()) continue;
+        if (group == Group::GeometryOnly && !s->is_geometry()) continue;
+        scratch_out_.clear();
+        s->process(scratch_in_.data(), scratch_in_.data() + scratch_in_.size(),
+                   scratch_out_);
+        scratch_in_.swap(scratch_out_);
     }
-    out = std::move(cur);
+    out.assign(scratch_in_.begin(), scratch_in_.end());
 }
 
-bool FilterChain::has_enabled() const {
+bool FilterChain::has_enabled() const { return has_enabled(Group::All); }
+
+bool FilterChain::has_enabled(Group group) const {
     std::lock_guard<std::mutex> lk(chain_mutex());
     for (const auto& kv : stages_) {
-        if (kv.second->enabled()) return true;
+        if (!kv.second->enabled()) continue;
+        if (group == Group::All) return true;
+        if (group == Group::ValueOnly && !kv.second->is_geometry()) return true;
+        if (group == Group::GeometryOnly && kv.second->is_geometry()) return true;
     }
     return false;
 }

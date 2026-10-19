@@ -134,12 +134,11 @@ SettingsPanel::SettingsPanel(AlgoBridge* bridge, FileConverter* converter,
 
     // ActivityBar → QStackedWidget page switch.
     connect(activity_bar_, &ActivityBar::group_selected, this,
-            [this](int index, const QString& title) {
+            [this](int index, const QString&) {
                 if (index >= 0 && index < stacked_->count()) {
                     stacked_->setCurrentIndex(index);
                     QSettings().setValue(QStringLiteral("sidebar/active_group"),
                                          index);
-                    emit current_title_changed(title);
                 }
             });
 
@@ -154,11 +153,6 @@ SettingsPanel::SettingsPanel(AlgoBridge* bridge, FileConverter* converter,
     activity_bar_->select(saved);
 }
 
-QString SettingsPanel::current_title() const {
-    return activity_bar_ ? activity_bar_->title_at(activity_bar_->current_index())
-                         : QString();
-}
-
 void SettingsPanel::refresh_icons() {
     if (activity_bar_) activity_bar_->refresh_icons();
     // Force QSS re-polish on the entire panel so all child widgets pick up the
@@ -166,6 +160,14 @@ void SettingsPanel::refresh_icons() {
     style()->unpolish(this);
     style()->polish(this);
     update();
+}
+
+void SettingsPanel::apply_source_capabilities(bool trigger, bool esp) {
+    // The panels live inside their group page; QWidget::setVisible reflows
+    // the group layout. The ActivityBar icon is per-group, so it stays —
+    // the Hardware group keeps its other panels (Biases, ROI, Preprocessing).
+    if (auto* p = find_panel(QStringLiteral("esp"))) p->setVisible(esp);
+    if (auto* p = find_panel(QStringLiteral("trigger"))) p->setVisible(trigger);
 }
 
 void SettingsPanel::toggle_content() {

@@ -1,13 +1,20 @@
 // algo/calibration/intrinsic.h — intrinsic camera calibration (Zhang method).
 //
-// Phase 9 (design §4.5.1): detects chessboard / circle-grid corners in
-// accumulated event frames, accumulates multi-pose observations, and runs
-// cv::calibrateCamera to produce K, distCoeffs and an RMS reprojection error.
+// Detection: a BLINKING CHESSBOARD is displayed on screen (alternating with a
+// blank frame at 10 ms). Pixels on black squares toggle dark↔light every cycle
+// and fire both polarities; over a capture window covering ≥ one blink cycle
+// they form a filled checkerboard in the binary "blink frame"
+// (see blinking_detect.h), which is fed to cv::findChessboardCorners.
 //
-// The algorithm is frame-driven: the GUI wizard feeds accumulated grayscale
-// frames via add_frame(). Detection runs synchronously on the caller's thread
-// (cheap relative to calibration itself). Once enough poses are collected,
-// run() performs the bundle adjustment.
+// Solving: TWO-PASS calibration. Pass 1 fixes K3 + aspect ratio for a stable
+// initial fit and computes per-view reprojection errors; views whose error
+// exceeds mean + outlier_ths·std are removed; pass 2 re-runs calibrateCamera
+// on the kept views with K3 free. An optional fronto-parallel refinement pass
+// (undistort → homography → re-detect subpix) is planned as a later phase.
+//
+// The algorithm is frame-driven: the GUI wizard feeds accumulated binary blink
+// frames via add_frame()/detect_only()+accept(). Detection runs synchronously
+// on the caller's thread; run() performs the (two-pass) bundle adjustment.
 
 #ifndef GUI_ALGO_CALIBRATION_INTRINSIC_H
 #define GUI_ALGO_CALIBRATION_INTRINSIC_H
@@ -22,30 +29,31 @@ namespace gui_algo {
 
 /// @brief Pattern type for calibration board detection.
 enum class CalibrationPattern {
-    Chessboard,     ///< Standard chessboard (inner corners)
-    CircleGrid,     ///< Regular circle grid
-    AsymmetricCircles ///< Asymmetric circle grid
+    Chessboard,     ///< Blinking chessboard (inner corners); the wizard's default.
+    CircleGrid      ///< Regular circle grid (static detection, kept for reuse).
 };
 
 /// @brief Result of a single frame's corner detection.
 struct DetectionResult {
     bool found{false};
-    cv::Mat image;                 ///< Annotated copy (for wizard preview)
-    std::vector<cv::Point2f> points; ///< Detected corner coordinates
+    cv::Mat image;                    ///< Annotated copy (for wizard preview)
+    std::vector<cv::Point2f> points;  ///< Detected corner coordinates
 };
 
-/// @brief Result of the full intrinsic calibration.
+/// @brief Result of the full intrinsic calibration (two-pass).
 struct IntrinsicResult {
     bool ok{false};
-    double rms{0.0};               ///< Reprojection RMS (pixels)
-    cv::Mat K;                     ///< 3x3 camera matrix
-    cv::Mat dist_coeffs;           ///< 1x5 distortion [k1,k2,p1,p2,k3]
-    std::vector<cv::Mat> rvecs;    ///< Per-frame rotation vectors
-    std::vector<cv::Mat> tvecs;    ///< Per-frame translation vectors
-    std::size_t frames_used{0};
-    std::string error;             ///< Empty when ok==true
-    cv::Mat undistort_map_x;       ///< Precomputed undistort LUT (x), design §4.5.1
-    cv::Mat undistort_map_y;       ///< Precomputed undistort LUT (y), design §4.5.1
+    double rms{0.0};                   ///< Overall RMS reprojection error (kept views)
+    cv::Mat K;                         ///< 3x3 camera matrix
+    cv::Mat dist_coeffs;               ///< 1x5 distortion [k1,k2,p1,p2,k3]
+    std::vector<cv::Mat> rvecs;        ///< Per-KEPT-view rotation vectors
+    std::vector<cv::Mat> tvecs;        ///< Per-KEPT-view translation vectors
+    std::size_t frames_used{0};        ///< == kept_frames
+    std::size_t kept_frames{0};        ///< Views surviving outlier rejection
+    std::size_t removed_frames{0};     ///< Views rejected by outlier rule
+    std::vector<bool> selected_views;  ///< Per ORIGINAL input view (survived?)
+    std::vector<double> per_view_rms;  ///< RMS per KEPT view (parallel to rvecs)
+    std::string error;                 ///< Empty when ok==true
 };
 
 /// @brief Intrinsic calibration accumulator.
@@ -55,74 +63,67 @@ public:
     ~IntrinsicCalibration();
 
     /// @brief Configures the board geometry. Must be called before add_frame().
+    /// Changing the pattern type or corner count clears accumulated
+    /// observations (they would feed cv::calibrateCamera inconsistent point
+    /// sets otherwise). The square size is a pure world-scale factor — pixel
+    /// observations stay valid when it changes, so it never clears anything;
+    /// run() rebuilds the object grid from the CURRENT value, which is what
+    /// the final calibration uses.
     void set_pattern(CalibrationPattern pattern,
                      int cols, int rows,
                      float square_size_mm);
 
-    /// @brief Attempts to detect the calibration pattern in @p frame.
-    /// @param frame Grayscale or BGR accumulated event frame.
-    /// @param annotate If true, @p result.image contains a drawn preview.
-    /// @return DetectionResult with found state and corner points.
+    /// @brief Sets the outlier-rejection threshold: views with per-view RMS
+    /// reprojection error above mean + ths·std are dropped before pass 2.
+    /// ths <= 0 keeps all views. Default 2.0.
+    void set_outlier_threshold(double ths);
+
+    /// @brief Attempts to detect the calibration pattern in @p frame and, on
+    /// success, accumulates the observation. Convenience wrapper around
+    /// detect_only() + accept().
     DetectionResult add_frame(const cv::Mat& frame, bool annotate = true);
 
-    /// @brief Runs cv::calibrateCamera on all collected observations.
-    /// On success, precomputes the undistort LUT (design §4.5.1).
+    /// @brief Runs pattern detection only — does NOT accumulate. Lets the
+    /// caller reject a frame (duplicate pose, insufficient coverage, …)
+    /// before committing it via accept(). Records image_size_ on first call.
+    DetectionResult detect_only(const cv::Mat& frame, bool annotate = true);
+
+    /// @brief Commits an already-detected point set as a calibration
+    /// observation. @p points must come from a successful detect_only() on a
+    /// frame of the configured geometry.
+    void accept(const std::vector<cv::Point2f>& points);
+
+    /// @brief Removes the most recently accepted observation (image + object
+    /// points). Used by the wizard's "Delete this capture" button. No-op if empty.
+    void remove_last_frame();
+
+    /// @brief Returns true if @p points match (within @p threshold_px mean
+    /// Euclidean distance) any already-accepted observation.
+    bool is_duplicate_pose(const std::vector<cv::Point2f>& points,
+                           double threshold_px) const;
+
+    /// @brief Runs the two-pass calibration (see header comment).
     IntrinsicResult run();
 
     /// @brief Discards all collected observations.
     void reset();
 
     std::size_t frame_count() const { return image_points_.size(); }
-    cv::Size board_size() const { return board_size_; }
     cv::Size image_size() const { return image_size_; }
 
-    /// @brief Precomputes the HxW undistort LUT via cv::initUndistortRectifyMap.
-    /// Fills undistort_map_x_ / undistort_map_y_ for O(1) runtime remap.
-    /// @note These maps are the INVERSE mapping (per undistorted output pixel,
-    ///       the distorted input coordinate to sample), suitable for cv::remap
-    ///       on accumulated event frames. They are NOT suitable for per-event
-    ///       distorted→undistorted address remapping; use
-    ///       build_event_undistort_lut() / undistort_point() for that.
-    /// @param image_size Output image size for the LUT.
-    void precompute_undistort_lut(cv::Size image_size);
-
-    /// @brief Accessor for the precomputed x-map (empty until run/precompute).
-    const cv::Mat& undistort_map_x() const { return undistort_map_x_; }
-    /// @brief Accessor for the precomputed y-map (empty until run/precompute).
-    const cv::Mat& undistort_map_y() const { return undistort_map_y_; }
-
-    /// @brief Builds the forward (distorted→undistorted) per-event address LUT
-    ///        via cv::undistortPoints, mirroring SingleCameraCalibration.java
-    ///        L700-718. Indexed row-major as event_undistort_lut_[y*width+x].
-    ///        Empty until run()/precompute_undistort_lut() succeeds.
-    void build_event_undistort_lut(cv::Size image_size);
-
-    /// @brief Accessor for the forward per-event undistort LUT.
-    const std::vector<cv::Point2f>& event_undistort_lut() const {
-        return event_undistort_lut_;
-    }
-    cv::Size event_undistort_lut_size() const { return event_lut_size_; }
-
-    /// @brief Remaps a single distorted pixel address to the undistorted plane
-    ///        using the forward LUT built by build_event_undistort_lut().
-    /// @return true on success (LUT built and (x,y) in range); false otherwise.
-    bool undistort_point(int x, int y, float& ux, float& uy) const;
+    /// @brief The object-point grid for the currently configured geometry
+    /// (read-only). Exposed so the wizard/tests can verify the configured
+    /// board matches the displayed pattern.
+    std::vector<cv::Point3f> object_grid() const { return make_object_grid(); }
 
 private:
     CalibrationPattern pattern_{CalibrationPattern::Chessboard};
-    cv::Size board_size_{0, 0};    ///< (cols-1, rows-1) for chessboard, (cols, rows) for circles
+    cv::Size board_size_{0, 0};    ///< Inner-corner count for chessboard (== OpenCV patternSize), (cols, rows) for circles
     float square_size_mm_{1.0f};
+    double outlier_ths_{2.0};
     cv::Size image_size_{0, 0};
 
     std::vector<std::vector<cv::Point2f>> image_points_;
-    std::vector<std::vector<cv::Point3f>> object_points_;
-
-    cv::Mat K_;                ///< Cached camera matrix (from last successful run)
-    cv::Mat dist_coeffs_;      ///< Cached distortion coefficients (from last run)
-    cv::Mat undistort_map_x_;  ///< Inverse undistort LUT (x) for cv::remap, design §4.5.1
-    cv::Mat undistort_map_y_;  ///< Inverse undistort LUT (y) for cv::remap, design §4.5.1
-    std::vector<cv::Point2f> event_undistort_lut_; ///< Forward distorted→undistorted per-event LUT.
-    cv::Size event_lut_size_{0, 0};                ///< Size of the forward LUT.
 
     std::vector<cv::Point3f> make_object_grid() const;
 };

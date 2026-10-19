@@ -2,6 +2,16 @@
 
 This guide builds the vendored `openeb/` tree, packages `EBplus.app`, and creates a local DMG for Apple Silicon Macs.
 
+## Development Branches
+
+Upstream is [Ziqing7226/EBplus__more-than-gui-for-openeb](https://github.com/Ziqing7226/EBplus__more-than-gui-for-openeb),
+whose development branch is `main` (there is no `master` branch). macOS
+integration and synchronization pull requests live in
+[xiangtianheng/EBplus--GUI_for_openEB](https://github.com/xiangtianheng/EBplus--GUI_for_openEB)
+and target the fork's `main`, which intentionally includes macOS support.
+Upstream `main` remains platform-neutral. Keep upstream updates and the macOS overlay
+reviewable as described in `AGENTS.md`.
+
 ## Scope
 
 - Target architecture: `arm64`
@@ -14,7 +24,8 @@ The current package is suitable for local testing. It is ad-hoc signed, not Deve
 
 ## Dependencies
 
-Install Xcode command line tools and Homebrew dependencies:
+Install Xcode command line tools and Homebrew dependencies. The calibration
+compatibility header supports OpenCV 4 and the OpenCV 5 module split:
 
 ```bash
 xcode-select --install
@@ -50,6 +61,7 @@ Useful overrides:
 ```bash
 ARCH=arm64 BUILD_TYPE=Release ./scripts/build_macos_app.sh
 CREATE_DMG=OFF ./scripts/build_macos_app.sh
+CMAKE_BUILD_PARALLEL_LEVEL=3 CREATE_DMG=OFF ./scripts/build_macos_app.sh
 QT_PREFIX=/opt/homebrew/opt/qtbase ./scripts/build_macos_app.sh
 QTSVG_PREFIX=/opt/homebrew/opt/qtsvg ./scripts/build_macos_app.sh
 ```
@@ -91,7 +103,8 @@ There is also a Codex-friendly run wrapper:
 ./script/build_and_run.sh
 ```
 
-It builds the app, opens `build/dist/EBplus.app`, and checks that the `EBplus` process starts.
+It builds the app and opens `build/dist/EBplus.app`. Use
+`./script/build_and_run.sh --verify` to also check that the `EBplus` process starts.
 
 ## Verification
 
@@ -131,9 +144,27 @@ cmake --build build/macos-tests --parallel
 ctest --test-dir build/macos-tests --output-on-failure
 ```
 
-AppleClang reports three existing header-only warnings more aggressively than the Linux toolchains. The algorithm test targets keep `-Werror` and relax only those three warning categories on macOS.
+The algorithm test targets keep `-Werror` and relax three existing AppleClang
+warning categories on macOS. All GTest targets share a configurable 60-second
+discovery timeout (`EBPLUS_GTEST_DISCOVERY_TIMEOUT`).
+
+The suite includes synthetic DAVIS/DVXplorer protocol, AEDAT4/LZ4 and playback
+tests. Real-recording tests use `EBPLUS_TEST_AEDAT4` and `EBPLUS_TEST_ALPDATA`
+when those recordings are available; model inference requires separately
+installed ONNX weights. CTest reports unavailable fixtures as skipped. Live
+DAVIS/DVXplorer USB operation still requires hardware validation on macOS.
 
 ## Signing And Distribution
+
+The macOS CI limits compilation to three jobs per runner and cancels older
+runs of the same pull request or branch. Local builds default to the host's
+logical CPU count; `CMAKE_BUILD_PARALLEL_LEVEL` overrides it.
+
+The macOS CI checks pull requests into the fork's `main` and pushes to that
+branch, while retaining `develop-MacOS` triggers for existing integration work.
+Successful app jobs upload `EBplus-macos-arm64-app.zip`, created with
+`ditto` so the bundle retains executable permissions and symbolic links after
+download. The independent test job runs the complete CTest suite.
 
 The default package uses ad-hoc signing:
 
@@ -152,4 +183,4 @@ For external distribution, replace the ad-hoc signing step with Developer ID sig
 ## Notes
 
 - HDF5 is not a supported feature of the current macOS package because `openeb/sdk/modules/stream/cpp/3rdparty/hdf5_ecf` is not populated in this checkout. The UI may still expose HDF5 actions inherited from the cross-platform application; enable and validate the dependency before distributing a package that advertises HDF5 support.
-- The packaged app was validated with a CenturyArks SilkyEvCam: one device source was discovered, connected as IMX636 v4.2 at 1280x720, and streamed at 30 fps. Other vendors still require their matching HAL plugin.
+- The July 2026 macOS build was validated with a CenturyArks SilkyEvCam: one device source was discovered, connected as IMX636 v4.2 at 1280x720, and streamed at 30 fps. This is historical hardware evidence; repeat it after upstream synchronization. Other vendors still require their matching HAL plugin.

@@ -46,39 +46,27 @@ public:
         : width_(width), height_(height),
           surface_(static_cast<std::size_t>(2) * static_cast<std::size_t>(width)
                        * static_cast<std::size_t>(height), 0),
-          ori_history_(static_cast<std::size_t>(width)
-                           * static_cast<std::size_t>(height), 0) {}
+          ori_history_float_(static_cast<std::size_t>(width)
+                                  * static_cast<std::size_t>(height), -1.0F) {}
 
-    void set_time_window_us(int v) { time_window_us_ = clamp_i(v, 1000, 50000); }
-    void set_min_neighbors(int v) { min_neighbors_ = clamp_i(v, 1, 8); }
     void set_color_map(ColorMap m) { color_map_ = m; }
     /// @brief jAER minDtThresholdUs: an orientation is emitted only if the
     /// per-orientation aggregate delta-time is below this (us). Default 100000.
     void set_min_dt_threshold_us(int v) { min_dt_threshold_us_ = clamp_i(v, 1, 1000000); }
-    /// @brief multi-ori output (jAER multiOriOutputEnabled). false = WTA
-    /// (only the best orientation per event); true = emit all orientations
-    /// that pass the coincidence gate.
-    void set_multi_ori_output(bool v) { multi_ori_output_ = v; }
     /// @brief jAER useAverageDtEnabled: true = average dt, false = max dt.
     void set_use_average_dt(bool v) { use_average_dt_ = v; }
     /// @brief jAER oriHistoryEnabled: temporal smoothing of orientation labels.
     void set_ori_history_enabled(bool v) { ori_history_enabled_ = v; }
-    /// @brief jAER passAllEvents: if true, events with no valid orientation
-    /// are still passed through (with orientation = -1).
-    void set_pass_all_events(bool v) { pass_all_events_ = v; }
     /// @brief jAER dtRejectThreshold: delta-times above this are rejected as
     /// outliers when computing per-orientation average/max dt.
     void set_dt_reject_threshold_us(int v) { dt_reject_threshold_us_ = clamp_i(v, 1, 10000000); }
 
-    int time_window_us() const { return time_window_us_; }
-    int min_neighbors() const { return min_neighbors_; }
     ColorMap color_map() const { return color_map_; }
     int min_dt_threshold_us() const { return min_dt_threshold_us_; }
-    bool multi_ori_output() const { return multi_ori_output_; }
     bool use_average_dt() const { return use_average_dt_; }
     bool ori_history_enabled() const { return ori_history_enabled_; }
-    bool pass_all_events() const { return pass_all_events_; }
     int dt_reject_threshold_us() const { return dt_reject_threshold_us_; }
+    float ori_history_diff_threshold() const { return ori_history_diff_threshold_; }
     int width() const { return width_; }
     int height() const { return height_; }
 
@@ -100,49 +88,67 @@ public:
         ori_decide_helper.fill(std::numeric_limits<Metavision::timestamp>::max());
 
         for (int ori = 0; ori < kNumOrientations; ++ori) {
+            // jAER computeRFOffsets: offset = s*d + w*pd, where d is the
+            // orientation base offset and pd = baseOffsets[(ori+2)%4] the
+            // PERPENDICULAR offset. The 2D grid samples the orientation
+            // direction AND both perpendicular sides — the perpendicular
+            // samples are what actually disambiguate the orientation (the
+            // edge is continuous along d, discontinuous across it). The
+            // former 1D-only traversal (s*d only) discarded the
+            // perpendicular information and biased every label toward the
+            // nearest-neighbour direction.
             const int bdx = kBaseDx[ori];
             const int bdy = kBaseDy[ori];
+            const int pdx = kBaseDx[(ori + 2) % kNumOrientations];
+            const int pdy = kBaseDy[(ori + 2) % kNumOrientations];
             std::array<Metavision::timestamp, kRfSize> dts{};
-            int count = 0;
+            std::array<bool, kRfSize> valid{};
+            dts.fill(0);
+            valid.fill(false);
+            int slot = 0;
             for (int s = -kRfLength; s <= kRfLength; ++s) {
                 if (s == 0) continue;
-                const int idx = (s + kRfLength) - (s > 0 ? 1 : 0); // compact index
-                const int nx = e.x + s * bdx;
-                const int ny = e.y + s * bdy;
-                if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) {
-                    dts[idx < kRfSize ? idx : 0] = std::numeric_limits<Metavision::timestamp>::max();
-                    continue;
+                for (int w = -kRfWidth; w <= kRfWidth; ++w) {
+                    const int nx = e.x + s * bdx + w * pdx;
+                    const int ny = e.y + s * bdy + w * pdy;
+                    if (nx < 0 || nx >= width_ || ny < 0 || ny >= height_) {
+                        ++slot;
+                        continue;  // jAER: out-of-bounds neighbour skipped
+                    }
+                    const Metavision::timestamp lt = surface_[idx_of(nx, ny, pol)];
+                    if (lt == 0) {
+                        ++slot;
+                        continue;  // never seen: skipped
+                    }
+                    dts[slot] = e.t - lt;
+                    valid[slot] = true;
+                    ++slot;
                 }
-                const Metavision::timestamp lt = surface_[idx_of(nx, ny, pol)];
-                if (lt == 0) {
-                    dts[idx < kRfSize ? idx : 0] = std::numeric_limits<Metavision::timestamp>::max();
-                    continue;
-                }
-                dts[idx < kRfSize ? idx : 0] = e.t - lt;
-                ++count;
             }
 
             if (use_average_dt_) {
                 // jAER L160-191: average dt with outlier rejection + variance.
                 Metavision::timestamp sum = 0;
-                int valid = 0;
+                int nvalid = 0;
                 for (int i = 0; i < kRfSize; ++i) {
+                    if (!valid[i]) continue;
                     const Metavision::timestamp dt = dts[i];
                     if (dt < 0 || dt > dt_reject_threshold_us_) continue;
                     sum += dt;
-                    ++valid;
+                    ++nvalid;
                 }
-                if (valid > 0) {
-                    oridts[ori] = sum / valid;
+                if (nvalid > 0) {
+                    oridts[ori] = sum / nvalid;
                     // Variance estimator (jAER oriDecideHelper).
                     double var = 0.0;
                     for (int i = 0; i < kRfSize; ++i) {
+                        if (!valid[i]) continue;
                         const Metavision::timestamp dt = dts[i];
                         if (dt < 0 || dt > dt_reject_threshold_us_) continue;
                         const double diff = static_cast<double>(dt) - static_cast<double>(oridts[ori]);
                         var += diff * diff;
                     }
-                    var /= static_cast<double>(valid);
+                    var /= static_cast<double>(nvalid);
                     ori_decide_helper[ori] = static_cast<Metavision::timestamp>(var);
                 }
             } else {
@@ -150,6 +156,7 @@ public:
                 Metavision::timestamp maxdt = std::numeric_limits<Metavision::timestamp>::min();
                 Metavision::timestamp second_max = std::numeric_limits<Metavision::timestamp>::min();
                 for (int i = 0; i < kRfSize; ++i) {
+                    if (!valid[i]) continue;
                     const Metavision::timestamp dt = dts[i];
                     if (dt < 0 || dt > dt_reject_threshold_us_) continue;
                     if (dt > maxdt) {
@@ -186,21 +193,36 @@ public:
 
         if (dir == -1) {
             // jAER L256-258: no good orientation found.
-            return pass_all_events_ ? -1 : -1;
+            return -1;
         }
 
-        // jAER L260-275: oriHistory temporal smoothing.
+        // jAER L260-275: oriHistory is a GATE (not a smoother). The history
+        // map is a float low-pass of past orientation labels (mixing factor
+        // 0.1); a label is emitted only when it agrees with the history
+        // within oriHistoryDiffThreshold (0.5 = half a type); the emitted
+        // label is the ORIGINAL dir, not the smoothed value. The map is
+        // initialised to -1 so the first label at a pixel is accepted
+        // without a horizontal bias.
         if (ori_history_enabled_) {
             const std::size_t hidx = static_cast<std::size_t>(e.y) * width_ + e.x;
-            const int hist = ori_history_[hidx];
-            // IIR smooth: move history towards current orientation.
-            // jAER uses oriHistoryMixingFactor (default 0.25).
-            const float mix = ori_history_mixing_factor_;
-            const float smoothed = hist * (1.0F - mix) + static_cast<float>(dir) * mix;
-            int smoothed_ori = static_cast<int>(std::round(smoothed)) % kNumOrientations;
-            if (smoothed_ori < 0) smoothed_ori += kNumOrientations;
-            ori_history_[hidx] = smoothed_ori;
-            return smoothed_ori;
+            float f = ori_history_float_[hidx];
+            if (f < 0.0F) {
+                f = static_cast<float>(dir);
+            } else {
+                f = (1.0F - ori_history_mixing_factor_) * f +
+                    ori_history_mixing_factor_ * static_cast<float>(dir);
+            }
+            ori_history_float_[hidx] = f;
+            // Circular distance on the 4-type ring (jAER: |f-dir| with wrap
+            // at halfTypes).
+            float fd = f - static_cast<float>(dir);
+            constexpr int kHalf = kNumOrientations / 2;
+            if (fd > kHalf) fd -= static_cast<float>(kNumOrientations);
+            else if (fd < -kHalf) fd += static_cast<float>(kNumOrientations);
+            if (std::fabs(fd) > ori_history_diff_threshold_) {
+                return -1;  // disagree with history -> reject (jAER continue)
+            }
+            return dir;  // original label, NOT the smoothed value
         }
 
         return dir;
@@ -240,7 +262,7 @@ public:
 
     void reset() {
         std::fill(surface_.begin(), surface_.end(), 0);
-        std::fill(ori_history_.begin(), ori_history_.end(), 0);
+        std::fill(ori_history_float_.begin(), ori_history_float_.end(), -1.0F);
     }
 
 private:
@@ -255,8 +277,11 @@ private:
              + static_cast<std::size_t>(y) * width_ + x;
     }
 
-    /// RF size = 2 * kRfLength (offsets at s = -3,-2,-1,1,2,3).
-    static constexpr int kRfSize = 2 * kRfLength;
+    /// jAER RF size = 2 * length * (2*width + 1) — the RF spans BOTH the
+    /// orientation direction (s) and the perpendicular direction (w). We use
+    /// a square RF (width == length == kRfLength).
+    static constexpr int kRfWidth = kRfLength;
+    static constexpr int kRfSize = 2 * kRfLength * (2 * kRfWidth + 1);
 
     /// @brief Per-orientation along-direction unit offsets (jAER baseOffsets).
     /// ori 0 = horizontal (1,0), 1 = 45 deg (1,1), 2 = vertical (0,1),
@@ -277,20 +302,17 @@ private:
 
     int width_;
     int height_;
-    int time_window_us_{10000};
-    int min_neighbors_{2};
     int min_dt_threshold_us_{100000};  // jAER minDtThresholdUs
-    bool multi_ori_output_{false};     // jAER multiOriOutputEnabled
     bool use_average_dt_{true};        // jAER useAverageDtEnabled (default true)
     bool ori_history_enabled_{false};  // jAER oriHistoryEnabled
-    bool pass_all_events_{false};      // jAER passAllEvents
-    int dt_reject_threshold_us_{200000};  // jAER dtRejectThreshold (us)
-    float ori_history_mixing_factor_{0.25F};  // jAER oriHistoryMixingFactor
+    int dt_reject_threshold_us_{200000};  // jAER dtRejectThreshold 默认 500000（此处 200000 为有意收紧）
+    float ori_history_mixing_factor_{0.25F};  // 平滑器语义，jAER 门控版默认 0.1（见 classify 注释）
     ColorMap color_map_{ColorMap::Fixed4};
     // Polarity-separated time surface: 2 * width * height, channel = polarity.
     std::vector<Metavision::timestamp> surface_;
     // Per-pixel orientation history for temporal smoothing.
-    std::vector<int> ori_history_;
+    std::vector<float> ori_history_float_;  // jAER oriHistoryMap (float, -1 init)
+    float ori_history_diff_threshold_{0.5F};  // jAER oriHistoryDiffThreshold
 };
 
 } // namespace gui_algo

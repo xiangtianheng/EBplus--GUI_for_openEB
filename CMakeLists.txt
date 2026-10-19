@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(GUI_for_openEB LANGUAGES CXX VERSION 1.9.0)
+project(GUI_for_openEB LANGUAGES CXX VERSION 3.0.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,7 +14,7 @@ option(GUI_FOR_OPENEB_BUILD_TESTS "Build algorithm unit tests" ON)
 
 # GCC 15+ no longer implicitly includes <cstdint>; add it globally so that
 # uint8_t / uint16_t etc. used throughout the OpenEB headers stay available.
-# See doc/compile.md for details.
+# See wiki/compile.md for details.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "15")
     add_compile_options("-include;cstdint")
 endif()
@@ -27,7 +27,29 @@ endif()
 # --- External dependencies -------------------------------------------------
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets Svg)
 find_package(MetavisionSDK 5.2.0 REQUIRED COMPONENTS base core stream)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d videoio)
+# OpenCV — calib3d was split into calib/3d/stereo in OpenCV 5.0; probe the
+# version first, then require the correct component names.
+find_package(OpenCV REQUIRED)
+if(OpenCV_VERSION VERSION_GREATER_EQUAL "5.0")
+    # OpenCV 5.0 split calib3d into multiple modules (calib, 3d/geometry,
+    # stereo, ptcloud), and moved the chessboard/circle-grid pattern detection
+    # functions (findChessboardCorners, drawChessboardCorners, findCirclesGrid,
+    # CALIB_CB_*) from calib3d to objdetect. undistortPoints moved to geometry.
+    # The exact names vary across 5.x packaging — the "3d" module was renamed
+    # to "geometry" before the final 5.0.0 release, and Homebrew's opencv 5.0.0
+    # does not expose a "3d" component. Probe which components are actually
+    # provided and only require those that exist, so the build works across
+    # OpenCV 5.x packaging variants.
+    set(_OPENCV_CALIB_COMPONENTS "")
+    foreach(_comp calib 3d geometry stereo ptcloud objdetect)
+        if(TARGET opencv_${_comp})
+            list(APPEND _OPENCV_CALIB_COMPONENTS ${_comp})
+        endif()
+    endforeach()
+else()
+    set(_OPENCV_CALIB_COMPONENTS calib3d)
+endif()
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio ${_OPENCV_CALIB_COMPONENTS})
 
 # Qt MOC / UIC / RCC auto-processing
 set(CMAKE_AUTOMOC ON)
@@ -38,6 +60,18 @@ set(CMAKE_AUTORCC ON)
 # enable_testing() must be called BEFORE add_subdirectory(gui) so that the
 # gui/tests gtest_discover_tests() calls (design §3.11) register with CTest.
 enable_testing()
+
+# GTest discovery launches each test binary while the build is still running.
+# Apple Silicon can take longer than CMake's five-second default to load the
+# bundled OpenEB and Qt dependency graph.
+set(EBPLUS_GTEST_DISCOVERY_TIMEOUT 60 CACHE STRING
+    "Seconds allowed for GTest test-case discovery")
+function(ebplus_gtest_discover_tests target)
+    gtest_discover_tests(${target}
+        DISCOVERY_TIMEOUT ${EBPLUS_GTEST_DISCOVERY_TIMEOUT}
+        ${ARGN}
+    )
+endfunction()
 
 add_subdirectory(algo)
 add_subdirectory(gui)

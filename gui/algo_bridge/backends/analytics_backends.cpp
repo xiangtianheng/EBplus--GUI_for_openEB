@@ -1,6 +1,6 @@
 // gui/algo_bridge/backends/analytics_backends.cpp — frame producers + analyzers
 // (design §3.4). Split from the former algo_backend.cpp monolith.
-// Contains: EventToVideo, FlowStatistics, ISIAnalyzer.
+// Contains: EventToVideo, SensorSelfTest.
 
 #include "algo_bridge/algo_backend.h"
 #include "algo_bridge/backends/backend_common.h"
@@ -12,8 +12,6 @@
 #include <opencv2/imgproc.hpp>
 
 #include "algo/analytics/event_to_video.h"
-#include "algo/analytics/flow_statistics.h"
-#include "algo/analytics/isi_analyzer.h"
 #include "algo/analytics/sensor_self_test.h"
 
 using namespace gui::backend_detail;
@@ -41,9 +39,12 @@ class EventToVideoBackend final : public AlgoBackend {
     float relaxation_step_{0.1F};
     int im_iterations_{50};
     float fov_deg_{60.0F};
-    // E2VID params.
-    std::string model_path_;
+    // E2VID params. Each DL mode (2=E2VID, 3=E2VID+, 4=FireNet+,
+    // 5=HyperE2VID) has its own model path so all weight sets can be
+    // installed side by side; switching modes swaps the loaded model.
+    std::string model_paths_[4];
     int e2vid_num_bins_{5};
+    int e2vid_device_{0};  ///< 0=Auto, 1=CPU, 2=GPU (§4.4.2-GPU)
     bool e2vid_auto_hdr_{false};
     float unsharp_amount_{0.3F};
     float unsharp_sigma_{1.0F};
@@ -58,6 +59,25 @@ public:
         roi_.compute(sensor_w_, sensor_h_);
         preproc_.halve_coords_ = true;
         rebuild();
+    }
+    /// Index into model_paths_[] for DL modes (2..5), -1 for non-DL modes.
+    static int dl_index(gui_algo::EventToVideo::Mode m) {
+        return gui_algo::EventToVideo::mode_is_dl(m) ? static_cast<int>(m) - 2
+                                                     : -1;
+    }
+    /// Resolves the user's device policy for the current mode. FireNet+
+    /// executes WRONG on the OpenVINO GPU plugin (upstream 2026.4 iGPU
+    /// issue: the output collapses to a near-constant image — std 0.005 vs
+    /// 0.118 on CPU; the FP32 precision hint does not help; ORT-CPU and
+    /// OV-CPU agree bit-for-bit) — Auto therefore resolves to CPU for that
+    /// mode. An explicit GPU choice is still honored and visible in the
+    /// status line (dev=gpu).
+    int resolved_device() const {
+        if (mode_ == gui_algo::EventToVideo::Mode::FireNetPlus &&
+            e2vid_device_ == 0) {
+            return 1;  // CPU
+        }
+        return e2vid_device_;
     }
     void rebuild() {
         const int aw = roi_.enabled ? roi_.rw : sensor_w_;
@@ -81,11 +101,14 @@ public:
         algo_->set_relaxation_step(relaxation_step_);
         algo_->set_im_iterations(im_iterations_);
         algo_->set_fov_deg(fov_deg_);
-        // E2VID: load the ONNX model if a path is set. An empty path keeps
-        // the heuristic fallback; a non-empty path triggers load_model which
-        // may fail silently and also fall back (BUG-G9: comment corrected —
-        // the model IS loaded here in rebuild(), not deferred).
-        if (!model_path_.empty()) algo_->set_model_path(model_path_);
+        // E2VID family: load the current mode's ONNX model if a path is set.
+        // An empty path keeps the heuristic fallback (BUG-G9: comment
+        // corrected — the model IS loaded here in rebuild(), not deferred).
+        // Device policy goes BEFORE the model load so the fresh instance
+        // selects its runtime on the first load (no double reload).
+        algo_->set_e2v_device(resolved_device());
+        const int di = dl_index(mode_);
+        if (di >= 0) algo_->set_model_path(model_paths_[di]);
         algo_->set_e2vid_num_bins(e2vid_num_bins_);
         // Re-sync from the algo: when a model is loaded, set_num_bins ignores
         // the caller's value and uses model_num_bins_ (e2vid_inference.h).
@@ -119,9 +142,24 @@ public:
         bool need_rebuild = false;
         if (k == "mode") {
             int m = to_i(v);
-            if (m >= 0 && m <= 2) {
+            if (m >= 0 && m <= 5) {
                 mode_ = static_cast<gui_algo::EventToVideo::Mode>(m);
-                if (algo_) algo_->set_mode(mode_);
+                if (algo_) {
+                    algo_->set_mode(mode_);
+                    // Switching between DL modes swaps the loaded model
+                    // (each mode has its own weights; an empty path for the
+                    // target mode unloads and falls back to heuristic).
+                    const int di = dl_index(mode_);
+                    if (di >= 0) {
+                        // Re-resolve the device for the new mode BEFORE the
+                        // load (FireNet+ Auto resolves to CPU).
+                        algo_->set_e2v_device(resolved_device());
+                        algo_->set_model_path(model_paths_[di]);
+                        // Re-sync: the newly loaded model dictates num_bins
+                        // (same contract as the model_path branch, BUG-N11).
+                        e2vid_num_bins_ = algo_->e2vid_num_bins();
+                    }
+                }
             }
         } else if (k == "output_fps") {
             output_fps_ = to_i(v);
@@ -161,15 +199,30 @@ public:
         } else if (k == "fov_deg") {
             fov_deg_ = static_cast<float>(to_d(v));
             if (algo_) algo_->set_fov_deg(fov_deg_);
-        } else if (k == "model_path") {
-            model_path_ = v;
-            if (algo_) {
-                algo_->set_model_path(model_path_);
+        } else if (k == "model_path" || k == "e2vid_plus_model_path" ||
+                   k == "firenet_plus_model_path" ||
+                   k == "hypere2vid_model_path") {
+            // Per-DL-mode weight paths. The key determines which slot is
+            // written (mode 2 keeps the legacy "model_path" key for config
+            // backward compatibility); only the CURRENT mode's path is
+            // applied to the live algo.
+            const int slot = (k == "model_path") ? 0
+                             : (k == "e2vid_plus_model_path") ? 1
+                             : (k == "firenet_plus_model_path") ? 2
+                                                                : 3;
+            model_paths_[slot] = v;
+            if (algo_ && dl_index(mode_) == slot) {
+                algo_->set_model_path(v);
                 // num_bins is dictated by the loaded model (rpg_e2vid:
                 // model.num_bins). Sync the persisted value so subsequent
                 // ROI rebuilds keep the model's channel count.
                 e2vid_num_bins_ = algo_->e2vid_num_bins();
             }
+        } else if (k == "device") {
+            e2vid_device_ = to_i(v);
+            // set_device reloads the model from the cached path when the
+            // policy changes, so the runtime selection takes effect.
+            if (algo_) algo_->set_e2v_device(resolved_device());
         } else if (k == "num_bins") {
             e2vid_num_bins_ = to_i(v);
             if (algo_) {
@@ -207,11 +260,9 @@ public:
             preproc_.set_param("preproc_downsample", v);
             if (prev != v) rebuild();
             return;
-        } else if (k == "roi_enabled") { roi_.enabled = to_b(v); need_rebuild = true; }
-        else if (k == "roi_x") { roi_.x = to_i(v); need_rebuild = true; }
-        else if (k == "roi_y") { roi_.y = to_i(v); need_rebuild = true; }
-        else if (k == "roi_w") { roi_.w = to_i(v); need_rebuild = true; }
-        else if (k == "roi_h") { roi_.h = to_i(v); need_rebuild = true; }
+        }
+        // Phase 2.6: roi_* keys intentionally not handled (legacy per-backend
+        // ROI deleted; unified ROI at the source).
         if (need_rebuild) {
             // Only rebuild (which reloads the ONNX model) when the effective
             // dimensions actually change. ROI position changes (x, y) don't
@@ -248,17 +299,23 @@ public:
         if (k == "relaxation_step") return from_d(relaxation_step_);
         if (k == "im_iterations") return from_i(im_iterations_);
         if (k == "fov_deg") return from_d(fov_deg_);
-        if (k == "model_path") return model_path_;
+        if (k == "model_path") return model_paths_[0];
+        if (k == "e2vid_plus_model_path") return model_paths_[1];
+        if (k == "firenet_plus_model_path") return model_paths_[2];
+        if (k == "hypere2vid_model_path") return model_paths_[3];
+        if (k == "model_loaded") {
+            // Pseudo-param (not registered) for the panel's one-shot error
+            // hint (§五-H1): only meaningful in DL modes; empty = N/A.
+            return (gui_algo::EventToVideo::mode_is_dl(mode_) && algo_)
+                       ? from_b(algo_->e2vid_model_loaded()) : std::string{};
+        }
         if (k == "num_bins") return from_i(e2vid_num_bins_);
+        if (k == "device") return from_i(e2vid_device_);
         if (k == "auto_hdr") return from_b(e2vid_auto_hdr_);
         if (k == "unsharp_amount") return from_d(unsharp_amount_);
         if (k == "unsharp_sigma") return from_d(unsharp_sigma_);
         if (k == "bilateral_sigma") return from_d(bilateral_sigma_);
-        if (k == "roi_enabled") return from_b(roi_.enabled);
-        if (k == "roi_x") return from_i(roi_.x);
-        if (k == "roi_y") return from_i(roi_.y);
-        if (k == "roi_w") return from_i(roi_.w);
-        if (k == "roi_h") return from_i(roi_.h);
+        // Phase 2.6: roi_* keys intentionally not handled.
         return {};
     }
     void push_events(const Metavision::EventCD* b, const Metavision::EventCD* e) override {
@@ -305,6 +362,18 @@ public:
         r.status = "e2v: " + std::to_string(algo_->width()) + "x" +
                    std::to_string(algo_->height()) +
                    (roi_.enabled ? " (ROI)" : " (full)");
+        // §五-H1: a failed ONNX load silently falls back to the heuristic
+        // path — the status line must show which reconstruction is running
+        // so users don't mistake heuristic output for "E2VID quality".
+        // dev= shows the active neural runtime (gpu = OpenVINO GPU plugin,
+        // cpu = ONNX Runtime) — the Auto policy can silently pick either.
+        if (gui_algo::EventToVideo::mode_is_dl(algo_->mode())) {
+            if (algo_->e2vid_model_loaded()) {
+                r.status += " model=loaded dev=" + algo_->e2v_active_runtime();
+            } else {
+                r.status += " model=heuristic";
+            }
+        }
         return r;
     }
     void reset() override {
@@ -321,135 +390,6 @@ public:
     }
 };
 
-/// FlowStatistics backend — requires ground-truth flow samples (not available
-/// in real-time). Counts events and reports a status; no frame is produced.
-/// Supports ROI (design §5.6.6): when enabled, only ROI events are counted.
-class FlowStatisticsBackend final : public AlgoBackend {
-    gui_algo::FlowStatistics algo_;
-    std::vector<Metavision::EventCD> passthrough_;
-    RoiFilter roi_;
-    std::vector<gui_algo::Event> roi_buf_;
-    std::size_t total_events_{0};
-public:
-    FlowStatisticsBackend(int w, int h)
-        : algo_(gui_algo::FlowStatistics::Source::Synthetic, 5) {
-        roi_.init(w, h);
-    }
-    void set_param(const std::string& k, const std::string& v) override {
-        roi_.set_param(k, v);
-    }
-    std::string get_param(const std::string& k) const override {
-        auto r = roi_.get_param(k); if (!r.empty()) return r;
-        return {};
-    }
-    void push_events(const Metavision::EventCD* b, const Metavision::EventCD* e) override {
-        passthrough_.assign(b, e);
-        auto [ev, n] = roi_.apply(as_events(passthrough_.data()),
-                                   passthrough_.size(), roi_buf_);
-        total_events_ += n;
-    }
-    AlgoResult pull_result() override {
-        AlgoResult r;
-        r.filtered_events = passthrough_;
-        r.status = "flow_stats: " + std::to_string(total_events_) +
-                   " events (no GT — Passive mode)" +
-                   std::string(roi_.region.enabled ? " (ROI)" : "");
-        return r;
-    }
-    void reset() override { algo_.reset(); passthrough_.clear(); roi_buf_.clear(); total_events_ = 0; }
-};
-
-/// ISIAnalyzer backend — renders ISI histogram as frame.
-/// Complex algorithm (design §4.4.4): defaults to the center 128×128 ROI.
-class ISIAnalyzerBackend final : public AlgoBackend {
-    int sensor_w_{0}, sensor_h_{0};
-    ProcessRegion roi_;
-    bool per_pixel_{false};
-    float max_isi_ms_{100.0F};
-    std::unique_ptr<gui_algo::ISIAnalyzer> algo_;
-    std::vector<Metavision::EventCD> passthrough_;
-    std::vector<gui_algo::Event> roi_events_;
-    Preprocessor preproc_;
-public:
-    ISIAnalyzerBackend(int w, int h) : sensor_w_(w), sensor_h_(h) {
-        roi_.compute(sensor_w_, sensor_h_);
-        preproc_.halve_coords_ = true;
-        rebuild();
-    }
-    void rebuild() {
-        const int aw = roi_.enabled ? roi_.rw : sensor_w_;
-        const int ah = roi_.enabled ? roi_.rh : sensor_h_;
-        preproc_.init(aw, ah);
-        const int f = preproc_.factor();
-        algo_ = std::make_unique<gui_algo::ISIAnalyzer>(aw / f, ah / f, 32, max_isi_ms_, per_pixel_);
-    }
-    void set_param(const std::string& k, const std::string& v) override {
-        if (preproc_.set_param(k, v)) {
-            if (k == "preproc_downsample") rebuild();
-            return;
-        }
-        bool need_rebuild = false;
-        if (k == "per_pixel") {
-            per_pixel_ = to_b(v);
-            need_rebuild = true;
-        } else if (k == "max_isi_ms") {
-            max_isi_ms_ = static_cast<float>(to_d(v));
-            if (algo_) algo_->set_max_isi_ms(max_isi_ms_);
-        } else if (k == "roi_enabled") { roi_.enabled = to_b(v); need_rebuild = true; }
-        else if (k == "roi_x") { roi_.x = to_i(v); need_rebuild = true; }
-        else if (k == "roi_y") { roi_.y = to_i(v); need_rebuild = true; }
-        else if (k == "roi_w") { roi_.w = to_i(v); need_rebuild = true; }
-        else if (k == "roi_h") { roi_.h = to_i(v); need_rebuild = true; }
-        if (need_rebuild) { roi_.compute(sensor_w_, sensor_h_); rebuild(); }
-    }
-    std::string get_param(const std::string& k) const override {
-        auto pp = preproc_.get_param(k); if (!pp.empty()) return pp;
-        if (k == "roi_enabled") return from_b(roi_.enabled);
-        if (k == "per_pixel") return from_b(per_pixel_);
-        if (k == "max_isi_ms") return from_d(max_isi_ms_);
-        return {};
-    }
-    void push_events(const Metavision::EventCD* b, const Metavision::EventCD* e) override {
-        passthrough_.assign(b, e);
-        const auto* ev = as_events(passthrough_.data());
-        std::size_t n = passthrough_.size();
-        if (roi_.enabled && roi_.rw > 0 && roi_.rh > 0) {
-            crop_to_roi(ev, n, roi_, &preproc_, roi_events_);
-            ev = roi_events_.data();
-            n = roi_events_.size();
-        } else if (preproc_.active() && n > 0) {
-            auto [p, m] = preproc_.apply(ev, n);
-            roi_events_.assign(p, p + m);
-            ev = roi_events_.data();
-            n = m;
-        }
-        algo_->process(ev, n);
-    }
-    AlgoResult pull_result() override {
-        AlgoResult r;
-        r.filtered_events = passthrough_;
-        r.has_frame = true;
-        cv::Mat frame = algo_->render();
-        const int f = preproc_.factor();
-        if (f > 1 && !frame.empty()) {
-            const int aw = roi_.enabled ? roi_.rw : sensor_w_;
-            const int ah = roi_.enabled ? roi_.rh : sensor_h_;
-            cv::resize(frame, frame, cv::Size(aw, ah), 0, 0, cv::INTER_NEAREST);
-        }
-        r.frame = frame.clone();
-        r.status = "isi: histogram" + std::string(roi_.enabled ? " (ROI)" : " (full)");
-        return r;
-    }
-    void reset() override {
-        if (algo_) algo_->reset();
-        passthrough_.clear();
-        roi_events_.clear();
-    }
-    void set_sensor_dimensions(int w, int h) override {
-        sensor_w_ = w; sensor_h_ = h;
-        roi_.compute(sensor_w_, sensor_h_); rebuild();
-    }
-};
 
 /// SensorSelfTest backend — per-pixel refractory-period heatmap + bad-pixel
 /// detection (design §4.4.8). Processes the FULL sensor (no ROI, no
@@ -541,8 +481,6 @@ public:
 std::unique_ptr<AlgoBackend> create_analytics_backend(const std::string& name,
                                           int width, int height) {
     if (name == "event_to_video")              return std::make_unique<EventToVideoBackend>(width, height);
-    if (name == "flow_statistics")             return std::make_unique<FlowStatisticsBackend>(width, height);
-    if (name == "isi_analyzer")                return std::make_unique<ISIAnalyzerBackend>(width, height);
     if (name == "sensor_self_test")            return std::make_unique<SensorSelfTestBackend>(width, height);
     return nullptr;
 }

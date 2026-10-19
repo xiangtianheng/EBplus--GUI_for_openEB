@@ -3,6 +3,10 @@
 // Self-developed (design §4.3.9), inspired by the jAER rbodo optical-flow suite
 // and ClusterBasedOpticalFlow. Four modes:
 //   LocalPlanes  — local (x,y,t) plane fit (Benoit 2015); velocity = grad(T)/|grad(T)|².
+//                  注释定档（audit §一-2.2，有意不改实现）：jAER LocalPlanesFlow
+//                  对每个像素施加 50ms 不应期（同一像素 50ms 内只出一个流
+//                  向量）；本实现逐事件拟合，输出密度高 1-2 个数量级。这是
+//                  输出密度差异而非计算错误。
 //   LucasKanade  — ✅ 移植自 jAER LucasKanadeFlow (Benosman 2012).
 //                  Per-event flow from an event-count histogram: central
 //                  first-order spatial derivatives of the histogram, event
@@ -289,15 +293,25 @@ private:
                           std::vector<FlowVector>& out) {
         ensure_lk_ts();
         const Metavision::timestamp win = time_window_us_;
-        const int sr = search_radius_px_;   // neighborhood radius (jAER searchDistance)
+        const int sr = search_radius_px_;   // neighborhood radius (jAER searchDistance; jAER 默认 3)
         const int d = 1;                     // border margin for central first-order
+        // 单位清理版时间缩放：jAER 为 it = cnt×40 启发式；此处按窗口归一化
+        // 到 px/s（默认 win=20000 时为 cnt×50）。与下方 0.5 中心差分叠加，
+        // 默认窗口下本实现幅值 ≈ 2.5× jAER（§二-2.2，有意，非移植 bug）。
         const double scale = 1.0e6 / static_cast<double>(win);  // px/window -> px/s
         for (std::size_t i = 0; i < count; ++i) {
             const Event& e = events[i];
             if (e.x >= width_ || e.y >= height_) continue;
             const int p = e.p & 1;
-            // Add event timestamp to the histogram.
-            lk_ts_[lk_idx(e.x, e.y, p)].push_back(e.t);
+            const Metavision::timestamp cutoff = (e.t > win) ? (e.t - win) : 0;
+            // Add event timestamp to the histogram, pruning the pixel's own
+            // deque FIRST: events in the sr+d border band `continue` below
+            // without ever reaching the neighborhood prune, so a persistent
+            // edge-band pixel's deque grew without bound (unbounded memory
+            // in long sessions whose activity hugs the border).
+            auto& own = lk_ts_[lk_idx(e.x, e.y, p)];
+            own.push_back(e.t);
+            prune_lk_deque(own, cutoff);
             // Need margin of sr + d from border for central first-order derivatives.
             if (e.x < sr + d || e.x >= width_ - sr - d ||
                 e.y < sr + d || e.y >= height_ - sr - d) {
@@ -307,8 +321,6 @@ private:
             for (int jj = -sr - d; jj <= sr + d; ++jj) {
                 for (int ii = -sr - d; ii <= sr + d; ++ii) {
                     auto& dq = lk_ts_[lk_idx(e.x + ii, e.y + jj, p)];
-                    const Metavision::timestamp cutoff =
-                        (e.t > win) ? (e.t - win) : 0;
                     prune_lk_deque(dq, cutoff);
                 }
             }
@@ -325,7 +337,11 @@ private:
                     const int ny = e.y + jjj;
                     const double cnt =
                         static_cast<double>(lk_ts_[lk_idx(nx, ny, p)].size());
-                    // Central first-order spatial derivatives (jAER CentralFiniteDifferenceFirstOrder).
+                    // Central first-order spatial derivatives. 单位清理版：
+                    // jAER CentralFiniteDifferenceFirstOrder 无 0.5 因子；
+                    // 此处的 0.5 使结构张量 ×0.25（特征值缩小 4 倍，等效
+                    // jAER thr=4），与上方时间缩放叠加后幅值 ≈ 2.5× jAER
+                    // （§二-2.2，有意，非移植 bug）。
                     const double cnt_xp =
                         static_cast<double>(lk_ts_[lk_idx(nx + 1, ny, p)].size());
                     const double cnt_xm =
@@ -375,6 +391,7 @@ private:
                 vy = (sxy * sxt - sx2 * syt) / q_eig;
             }
             const double conf = lam1 > 0.0 ? lam2 / lam1 : 0.0;
+            // 差异：被门控拒绝的事件不输出（jAER 对拒绝事件输出零向量）。
             out.push_back(FlowVector(static_cast<float>(e.x),
                                      static_cast<float>(e.y),
                                      static_cast<float>(vx),
@@ -461,8 +478,10 @@ private:
                     if (sad >= max_sad_distance_) { valid = false; break; }
                     // motion at this scale = init - dx (init is coarser motion,
                     // -dx is the refinement). Convert back to level-0 coords.
-                    motion_x = (init_x - dx) << s;
-                    motion_y = (init_y - dy) << s;
+                    // *(1<<s), not << s: left-shifting a negative value is UB
+                    // in C++17 (§四-低13).
+                    motion_x = (init_x - dx) * (1 << s);
+                    motion_y = (init_y - dy) * (1 << s);
                     best_sad = sad;
                 }
                 if (!valid) continue;
@@ -654,7 +673,23 @@ private:
                 cl.last_t = e.t;
                 cl.mass = 1;
                 cl.history_len = 1;
-                of_clusters_.push_back(cl);
+                // Cap the cluster count (§四-待验证2): noise bursts could
+                // grow the list into the thousands and make every event's
+                // association O(n). Evict the weakest (then oldest) cluster.
+                if (of_clusters_.size() >= kMaxOFClusters) {
+                    std::size_t victim = 0;
+                    for (std::size_t k = 1; k < of_clusters_.size(); ++k) {
+                        const OFCluster& a = of_clusters_[k];
+                        const OFCluster& b = of_clusters_[victim];
+                        if (a.mass < b.mass ||
+                            (a.mass == b.mass && a.last_t < b.last_t)) {
+                            victim = k;
+                        }
+                    }
+                    of_clusters_[victim] = cl;
+                } else {
+                    of_clusters_.push_back(cl);
+                }
             } else {
                 OFCluster& cl = of_clusters_[best];
                 // Record previous position before EMA update.
@@ -664,7 +699,7 @@ private:
                     cl.prev_cy = cl.cy;
                     cl.prev_t = cl.last_t;
                 }
-                const float a = cluster_ema_alpha_;  // jAER spatialSmoothingFactor (default 0.05)
+                const float a = cluster_ema_alpha_;  // 质心 EMA 系数，对应 jAER RCT locationMixingFactor（非 spatialSmoothingFactor，见成员注释）
                 cl.cx = cl.cx * (1.0F - a) + static_cast<float>(e.x) * a;
                 cl.cy = cl.cy * (1.0F - a) + static_cast<float>(e.y) * a;
                 cl.last_t = e.t;
@@ -700,7 +735,7 @@ private:
     Mode mode_;
 
     // LocalPlanes + LucasKanade params ------------------------------------
-    int time_window_us_{20000};  // jAER LucasKanadeFlow default
+    int time_window_us_{20000};  // jAER maxDtThreshold 实为默认 50000（此处 20000 为有意收紧）
     int spatial_radius_px_{8};
     int min_events_per_cluster_{10};
     int block_size_{16};
@@ -710,7 +745,7 @@ private:
     // BlockMatch params ---------------------------------------------------
     int downsample_factor_{2};
     int bm_time_window_us_{20000};
-    int search_radius_px_{4};
+    int search_radius_px_{4};  // jAER searchDistance 默认 3（此处 4 为有意）
     int num_scales_{3};
     int max_slice_value_{15};
     double valid_pix_occupancy_{0.01};
@@ -729,7 +764,11 @@ private:
     int min_track_len_{5};
     int cluster_size_px_{10};
     int cluster_time_us_{5000};
-    float cluster_ema_alpha_{0.05F};  // jAER ClusterBasedOpticalFlow spatialSmoothingFactor
+    // 质心 EMA 系数，对应 jAER RectangularClusterTracker locationMixingFactor
+    // （数值巧合一致）。jAER ClusterBasedOpticalFlow 的 spatialSmoothingFactor
+    // 是网格流场平滑系数，本模式未实现该网格平滑，此前注释张冠李戴（§二-2.2）。
+    float cluster_ema_alpha_{0.05F};
+    static constexpr std::size_t kMaxOFClusters = 256;  // ClusterOF 簇数上限
     std::vector<OFCluster> of_clusters_;
 
     // Shared time surface (Surface of Active Events) ----------------------

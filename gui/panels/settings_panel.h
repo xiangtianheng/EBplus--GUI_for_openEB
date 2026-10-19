@@ -72,6 +72,13 @@ public:
     /// @brief Returns all registered panels.
     const std::vector<std::unique_ptr<AbstractPanel>>& panels() const { return panels_; }
 
+    /// @brief Phase 1 capability framework: shows/hides the facility-backed
+    /// hardware panels (ESP, Trigger) for the currently connected source.
+    /// Pass @p trigger/@p esp from CameraController::source_capabilities();
+    /// pass {true, true} (or call on disconnect) to restore the default
+    /// all-visible layout used when no camera is connected.
+    void apply_source_capabilities(bool trigger, bool esp);
+
     // Type-safe accessors (kept for MainWindow compatibility; each delegates
     // to find_panel() + static_cast so the registry is the single source of
     // truth). Phase 3 will migrate MainWindow to find_panel() directly.
@@ -86,10 +93,6 @@ public:
     PreprocessingPanel* preprocessing_panel() const;
     AlgorithmsPanel*    algorithms_panel()     const;
     FileToolsPanel*     file_tools_panel()     const;
-
-    /// @brief Returns the title of the currently-active group, used by
-    /// MainWindow to update the dock window title.
-    QString current_title() const;
 
     /// @brief Re-renders the ActivityBar icons with the current theme's
     /// foreground color. Called by MainWindow on theme_changed so icons
@@ -106,10 +109,6 @@ public:
     bool is_content_visible() const;
 
 signals:
-    /// @brief Emitted when the active group changes (user clicks an Activity
-    /// Bar entry, or the group is restored from QSettings at startup).
-    void current_title_changed(const QString& title);
-
     /// @brief Emitted when the sidebar content visibility changes (via
     /// toggle_content()). MainWindow connects this to resize the dock and
     /// update the toggle button's chevron icon (§11.2 point 5).

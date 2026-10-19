@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -43,6 +44,12 @@ struct OverlayPoint {
 struct OverlayColoredPoint {
     int x{0}, y{0};
     std::uint8_t r{255}, g{255}, b{255};
+};
+
+/// @brief 光流箭头(端点已按 pps_scale 缩放,含起点抖动;颜色 = 方向色编码)。
+struct OverlayFlowArrow {
+    int x1{0}, y1{0}, x2{0}, y2{0};
+    std::uint8_t r{0}, g{0}, b{0};  ///< arrow colour; all-zero = use the default
 };
 
 /// @brief 叠加层圆（霍夫圆输出）。
@@ -81,12 +88,16 @@ struct AlgoResult {
     std::vector<OverlayLine> lines;
     std::vector<OverlayPoint> points;
     std::vector<OverlayColoredPoint> colored_points;
+    std::vector<OverlayFlowArrow> flow_arrows;      ///< 光流箭头(sparse/dense flow)
     std::vector<OverlayCircle> circles;
     std::vector<OverlayText> texts;
     std::vector<ColoredEvent> colored_events;       ///< 朝向/方向着色事件
     std::vector<OverlayTrajectory> trajectories;    ///< 聚类轨迹
-    bool has_aux_frame{false};
-    cv::Mat aux_frame;                              ///< 辅助可视化帧（Hough 空间等）
+    /// 居中提示（如 freq_detector 初始化阶段的使用说明）：非空时在主显示
+    /// 帧中心绘制半透明底条 + 文字（'\n' 分行）。
+    std::string hint;
+    // Phase 2.6 debug D-2: has_aux_frame / aux_frame deleted with the hough
+    // aux display (jAER-style debug view, never visible in baseline practice).
 };
 
 /// @brief 类型擦除的算法后端接口。
@@ -117,9 +128,24 @@ public:
 
     /// @brief Updates the sensor dimensions and recomputes the ROI.
     /// Called when a new camera/file connects with different dimensions.
-    /// Backends that don't use sensor dimensions (overlay detectors, etc.)
-    /// can use the default no-op implementation.
+    /// This is effectively MANDATORY for every backend that filters by ROI
+    /// or holds sensor-sized buffers (audit §五-D1): the default no-op leaves
+    /// the backend computing its ROI at the stale construction dimensions,
+    /// which silently filters out most events on a smaller sensor.
+    /// Backends holding w×h algorithm state must additionally rebuild or
+    /// resize the algorithm here.
     virtual void set_sensor_dimensions(int /*width*/, int /*height*/) {}
+
+    /// @brief Per-batch OUTPUT event span for stream-filtering algorithms
+    /// (Phase 7 P6-A): the display pipeline and processed recording consume
+    /// this span INSTEAD of the conditioned input when non-null — so an
+    /// in-place filter (hot_pixel_filter) visibly removes events and EIS
+    /// displays stabilized coordinates. Zero-copy: the span points into a
+    /// backend-owned buffer that stays valid until the next push_events.
+    /// Default {nullptr, 0} = pass-through (the input span is unchanged);
+    /// detectors return nothing on purpose — they annotate, not filter.
+    virtual std::pair<const Metavision::EventCD*, std::size_t>
+    output_span() const { return {nullptr, 0}; }
 };
 
 /// @brief 工厂：按算法名字创建具体后端。

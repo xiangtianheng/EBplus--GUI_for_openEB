@@ -20,16 +20,8 @@ FrameAnnotator::FrameAnnotator() {
                        QStringLiteral("Monospace")});
 }
 
-void FrameAnnotator::set_pen_width(double w) {
-    pen_width_ = (w > 0.0) ? w : 1.0;
-}
-
 void FrameAnnotator::set_font(const QFont& font) {
     font_ = font;
-}
-
-void FrameAnnotator::set_default_color(const QColor& c) {
-    if (c.isValid()) default_color_ = c;
 }
 
 QColor FrameAnnotator::resolve(const QColor& c) const {
@@ -159,20 +151,21 @@ void FrameAnnotator::draw_flow_arrows(QImage& img, const std::vector<FlowArrow>&
     if (img.isNull() || arrows.empty()) return;
     QPainter p(&img);
     p.setRenderHint(QPainter::Antialiasing);
-    const QColor c = resolve(color);
-    p.setPen(QPen(c, pen_width_));
-    p.setBrush(c);
     for (const FlowArrow& a : arrows) {
+        const QColor c = a.color.isValid() ? a.color : resolve(color);
+        p.setPen(QPen(c, 1.0));  // thin arrows (the dense field reads better)
+        p.setBrush(c);
         p.drawLine(a.from, a.to);
-        // Arrowhead: two short segments at the tip.
+        // Arrowhead (OpenCV arrowedLine style): two segments from the tip,
+        // length = tipLength * shaft length, at +-tipAngle from the shaft.
         const double dx = a.to.x() - a.from.x();
         const double dy = a.to.y() - a.from.y();
         const double len = std::hypot(dx, dy);
         if (len < 1e-3) continue;
         const double ux = dx / len;
         const double uy = dy / len;
-        const double head = std::min(8.0, len * 0.4);
-        const double ang = 0.4;  // ~23°
+        const double head = std::min(10.0, len * 0.3);  // tipLength 30%
+        const double ang = 0.35;  // ~20°, sharper than the old 23°
         const QPointF h1(a.to.x() - head * (ux * std::cos(ang) + uy * std::sin(ang)),
                          a.to.y() - head * (uy * std::cos(ang) - ux * std::sin(ang)));
         const QPointF h2(a.to.x() - head * (ux * std::cos(ang) - uy * std::sin(ang)),
@@ -187,7 +180,26 @@ void FrameAnnotator::draw_colored_events(
         const std::vector<std::tuple<int, int, QColor>>& events) {
     if (img.isNull() || events.empty()) return;
     // Direct pixel manipulation is much faster than QPainter for per-event
-    // coloring (potentially 10k+ events per frame).
+    // coloring (potentially 10k+ events per frame). QImage::setPixel only
+    // supports 32-bit-depth and 8-bit-indexed formats — on the display
+    // pipeline's Format_RGB888 (24-bit) frames it warns and silently
+    // no-ops, so RGB888/BGR888 are written through the scanline pointer
+    // instead.
+    if (img.format() == QImage::Format_RGB888 ||
+        img.format() == QImage::Format_BGR888) {
+        const int bpl = img.bytesPerLine();
+        const bool bgr = img.format() == QImage::Format_BGR888;
+        uchar* bits = img.bits();
+        for (const auto& [x, y, color] : events) {
+            if (x < 0 || x >= img.width() || y < 0 || y >= img.height()) continue;
+            uchar* px = bits + static_cast<long>(y) * bpl + 3 * x;
+            px[0] = static_cast<uchar>(bgr ? color.blue() : color.red());
+            px[1] = static_cast<uchar>(color.green());
+            px[2] = static_cast<uchar>(bgr ? color.red() : color.blue());
+        }
+        return;
+    }
+    if (img.depth() != 32) return;  // setPixel would no-op with a warning
     for (const auto& [x, y, color] : events) {
         if (x < 0 || x >= img.width() || y < 0 || y >= img.height()) continue;
         img.setPixel(x, y, color.rgba());

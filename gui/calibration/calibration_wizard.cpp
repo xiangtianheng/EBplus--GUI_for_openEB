@@ -1,83 +1,274 @@
-// gui/calibration/calibration_wizard.cpp
+// gui/calibration/calibration_wizard.cpp — see header (blinking chessboard).
+//
+// Wires the event tap (drain_last_window) + CalibrationWorker (async blink-frame
+// chessboard detection + coverage/duplicate rejection, on-worker two-pass
+// cv::calibrateCamera, auto-mkdir YAML export) to the Space-key capture. On
+// Space the wizard accumulates the last capture-window of CD events into
+// per-polarity masks and hands them to the worker, which builds the binary
+// blink frame and runs chessboard detection. There is NO capture-review dialog:
+// a successful detection is committed directly (coverage + duplicate checks,
+// accumulation, progress) and a failure is reported on the status line.
 
+#include "calib_defaults.h"
 #include "calibration_wizard.h"
 
-#include <QApplication>
-#include <QComboBox>
-#include <QDialogButtonBox>
-#include <QDoubleSpinBox>
+#include <QDir>
+#include <QEvent>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
-#include <QImage>
+#include <QHideEvent>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QMessageBox>
+#include <QPaintEvent>
+#include <QPainter>
+#include <QPolygonF>
+#include <QPixmap>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QScreen>
 #include <QScrollArea>
+#include <QScreen>
+#include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSpinBox>
-#include <QStandardPaths>
-#include <QTabWidget>
+#include <QDoubleSpinBox>
+#include <QShowEvent>
+#include <QThread>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QMetaType>
 
-#include <opencv2/imgproc.hpp>
+#include <metavision/sdk/base/utils/timestamp.h>
 
+#include "algo/calibration/blinking_detect.h"
 #include "app/camera_controller.h"
-#include "chessboard_display.h"
+#include "blinking_chessboard_display.h"
+#include "calibration_worker.h"
 #include "display/event_display_widget.h"
 
 namespace gui {
 
 namespace {
 
-// 1 ms accumulation window, 50 ms capture cycle → 50 candidate windows per
-// cycle. The chessboard flips at 20 Hz (one flip per cycle), so the
-// max-event window is the one aligned with the flip burst.
-constexpr Metavision::timestamp kWindowUs = 1000;
-constexpr Metavision::timestamp kSpanUs   = 50000;
-constexpr int kCaptureTimerMs = 50;
+// Aim-feedback poll rate. 30 Hz matches the FocusAssistant.
+constexpr int kCameraPollMs = 33;
 
-// Default MSE below which two frames are considered duplicates (same pose).
-// 0-255 grayscale scale; 50 is conservative — different poses typically
-// produce MSE > 100.
-constexpr double kDefaultMseThreshold = 50.0;
+// Fixed asymmetric chessboard: 9×6 INNER corners (10×7 squares). The
+// asymmetric board gives the checkerboard a unique orientation, so there is no
+// cols/rows spinbox and no square-grid rejection.
+constexpr int kGridCols = 9;
+constexpr int kGridRows = 6;
+// 0 = "not measured yet". The user must measure one square edge and enter the
+// real value: captures are pixel observations and stay valid regardless, the
+// calibration only runs once a non-zero square size is entered, and Export
+// refuses the 0 default with a reminder popup.
+constexpr double kDefaultSquareMm = 0.0;
+constexpr int kDefaultTargetFrames = 20;
+
+// Space-capture event window (µs), user-tunable 200–200000 in 1 µs steps.
+// The chessboard blinks at 10 ms (pattern ↔ blank, a 20 ms full cycle); the
+// window must cover at least one full cycle so every toggling square fires both
+// polarities. The 100000 µs default covers ~5 blink cycles.
+constexpr int kCaptureWindowMinUs = 200;
+constexpr int kCaptureWindowMaxUs = 200000;
+constexpr int kCaptureWindowStepUs = 1;
+constexpr int kDefaultCaptureWindowUs = 100000;
+
+// Auto Bias rate band (Mev/s) forced while the wizard is open: the camera-
+// level controller keeps the TOTAL event rate inside this tight band by
+// adjusting bias_diff_on/off on-sensor. High enough that a 100000 µs capture
+// window still collects a dense blink frame, low enough that the USB link
+// (which saturates around ~104 Mev/s under the LCD backlight-PWM noise floor)
+// is never the bottleneck. 19.0/20.0 render cleanly in the Biases panel's
+// 1-decimal spinboxes. The values are tuned for the 1280×720 reference
+// sensor — apply_auto_bias_override scales them with the connected
+// camera's pixel count.
+constexpr float kCalibrationRateMinMev = 19.0F;
+constexpr float kCalibrationRateMaxMev = 20.0F;
+
+// Register cross-thread metatypes used by the worker signals/slots.
+Q_DECL_UNUSED static const int kRegCvMat = qRegisterMetaType<cv::Mat>("cv::Mat");
+Q_DECL_UNUSED static const int kRegSizeT = qRegisterMetaType<std::size_t>("std::size_t");
+Q_DECL_UNUSED static const int kRegPoints =
+    qRegisterMetaType<QVector<QPointF>>("QVector<QPointF>");
+Q_DECL_UNUSED static const int kRegBlinkCapture =
+    qRegisterMetaType<gui::BlinkCapture>("gui::BlinkCapture");
+
+// Inset (px per side) applied to the screen workarea when sizing the wizard.
+// The window must stay BELOW the compositor's full-screen threshold: on Mutter
+// (GNOME-50, XWayland, 200% scale), a window that covers most of the output is
+// put on the unredirect / direct-scanout path, which throttles the 30 Hz camera
+// preview → stutter. A/B testing proved the trigger is size/coverage-driven,
+// NOT content-driven (solid-disc and waffle patterns stutter identically at
+// near-full-screen, both smooth when the window is dragged clearly smaller).
+//
+// A 5 px/side inset (10 px total) was NOT enough — the physical surface still
+// covered ~95% of the 2880×1920 output and still stuttered. The coverage
+// threshold is coarser than a few px, so a substantial inset is needed. 50 px
+// per side (100 px total per dimension) drops the physical coverage to ~88%,
+// clearly below the scanout threshold on this display. This is intentionally
+// generous: if it still stutters, the lever is NOT window size and the fix must
+// instead isolate the camera preview on its own small surface (see the
+// separate-window fallback noted in show_intrinsic). Tunable — reduce toward
+// the minimum that stays smooth once the threshold is empirically pinned down.
+constexpr int kFullscreenGuardInset = 50;
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// CalibrationCameraView — lightweight camera preview (same approach as
+// FocusCameraView: QPainter::drawImage in paintEvent)
+// ---------------------------------------------------------------------------
+
+CalibrationCameraView::CalibrationCameraView(QWidget* parent) : QWidget(parent) {
+    setMinimumSize(240, 180);
+    setAutoFillBackground(false);
+    setAttribute(Qt::WA_OpaquePaintEvent);
+}
+
+void CalibrationCameraView::set_frame(const QImage& frame) {
+    frame_ = frame;
+    message_.clear();
+    update();
+}
+
+void CalibrationCameraView::set_message(const QString& msg) {
+    frame_ = QImage();
+    message_ = msg;
+    update();
+}
+
+void CalibrationCameraView::set_coverage_overlay(
+    const CoverageOverlay& overlay,
+    const std::vector<std::vector<cv::Point2f>>& views) {
+    overlay_ = overlay;
+    overlay_views_ = views;
+    update();
+}
+
+void CalibrationCameraView::paintEvent(QPaintEvent* /*event*/) {
+    QPainter p(this);
+    p.fillRect(rect(), QColor(20, 20, 20));
+    if (!frame_.isNull()) {
+        const QImage scaled = frame_.scaled(size(), Qt::KeepAspectRatio,
+                                            Qt::SmoothTransformation);
+        const double s = static_cast<double>(scaled.width()) / frame_.width();
+        const double ox = (width() - scaled.width()) / 2.0;
+        const double oy = (height() - scaled.height()) / 2.0;
+        p.drawImage(static_cast<int>(ox), static_cast<int>(oy), scaled);
+
+        // Coverage overlay: accepted corners as dots + convex hull of all
+        // accepted corners + area coverage %. Sensor px → widget px uses the
+        // same scale/offset as the frame blit above.
+        if (!overlay_views_.empty()) {
+            p.setRenderHint(QPainter::Antialiasing, true);
+            const auto map = [&](const cv::Point2f& pt) {
+                return QPointF(ox + s * pt.x, oy + s * pt.y);
+            };
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(90, 170, 255, 170));
+            for (const auto& view : overlay_views_) {
+                for (const auto& pt : view) {
+                    p.drawEllipse(map(pt), 2.0, 2.0);
+                }
+            }
+            if (overlay_.hull.size() >= 3) {
+                QPolygonF poly;
+                poly.reserve(static_cast<qsizetype>(overlay_.hull.size()));
+                for (const auto& pt : overlay_.hull) poly << map(pt);
+                p.setPen(QPen(QColor(90, 170, 255, 220), 2));
+                p.setBrush(QColor(90, 170, 255, 45));
+                p.drawPolygon(poly);
+            }
+            // Coverage percentage, top-left, on a translucent backing.
+            const QString text =
+                QStringLiteral("Coverage: %1%").arg(qRound(overlay_.coverage * 100));
+            const QRect tr = p.fontMetrics().boundingRect(text);
+            const QRect box(6, 4, tr.width() + 12, tr.height() + 8);
+            p.setPen(Qt::NoPen);
+            p.setBrush(QColor(0, 0, 0, 150));
+            p.drawRect(box);
+            p.setPen(QColor(235, 235, 235));
+            p.drawText(box, Qt::AlignCenter, text);
+        }
+    } else if (!message_.isEmpty()) {
+        p.setPen(QColor(160, 160, 160));
+        p.drawText(rect(), Qt::AlignCenter, message_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CalibrationWizard
+// ---------------------------------------------------------------------------
+
 CalibrationWizard::CalibrationWizard(QWidget* parent) : QDialog(parent) {
-    setWindowTitle(tr("Calibration Wizard"));
-    setMinimumSize(720, 560);
+    setWindowTitle(tr("Intrinsic Calibration (Blinking Chessboard)"));
+    // Qt::Window (instead of the default Qt::Dialog) gives a full top-level
+    // window with working minimize/close buttons. The maximize button is
+    // deliberately OMITTED: a maximized window covers the full workarea, which
+    // on Mutter (GNOME) triggers the unredirect / maximized compositing path
+    // and makes the 30 Hz camera preview stutter (see show_intrinsic). The
+    // changeEvent override below also blocks maximize from other paths (title-
+    // bar double-click, Super+Up, GNOME drag-to-top edge-tiling) since those
+    // bypass the button. Qt::WindowMaximizeButtonHint is intentionally absent.
+    setWindowFlags(Qt::Window | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+                   Qt::WindowMinimizeButtonHint | Qt::WindowCloseButtonHint);
+    setMinimumSize(900, 560);
+    build_ui();
 
-    intrinsic_ = std::make_unique<gui_algo::IntrinsicCalibration>();
+    camera_timer_ = new QTimer(this);
+    camera_timer_->setInterval(kCameraPollMs);
+    connect(camera_timer_, &QTimer::timeout, this, &CalibrationWizard::on_camera_tick);
 
-    tabs_ = new QTabWidget(this);
-    build_intrinsic_tab();
+    // Worker on a dedicated thread: detection (and the two-pass calibrateCamera)
+    // run off the GUI thread so OpenCV blocking does not freeze the UI.
+    worker_thread_ = new QThread(this);
+    worker_ = new CalibrationWorker;  // no parent — moved to worker_thread_
+    worker_->moveToThread(worker_thread_);
+    worker_thread_->start();
 
-    auto* layout = new QVBoxLayout(this);
-    layout->addWidget(tabs_);
+    connect(this, &CalibrationWizard::configure_requested,
+            worker_, &CalibrationWorker::configure);
+    connect(this, &CalibrationWizard::process_capture_requested,
+            worker_, &CalibrationWorker::process_capture);
+    connect(this, &CalibrationWizard::delete_last_capture_requested,
+            worker_, &CalibrationWorker::delete_last_capture);
+    connect(this, &CalibrationWizard::run_calibration_requested,
+            worker_, &CalibrationWorker::run_calibration);
+    connect(this, &CalibrationWizard::export_requested,
+            worker_, &CalibrationWorker::export_to);
+    connect(worker_, &CalibrationWorker::frame_accepted,
+            this, &CalibrationWizard::on_frame_accepted);
+    connect(worker_, &CalibrationWorker::frame_rejected,
+            this, &CalibrationWizard::on_frame_rejected);
+    connect(worker_, &CalibrationWorker::frame_deleted,
+            this, &CalibrationWizard::on_frame_deleted);
+    connect(worker_, &CalibrationWorker::capture_complete,
+            this, &CalibrationWizard::on_capture_complete);
+    connect(worker_, &CalibrationWorker::calibration_done,
+            this, &CalibrationWizard::on_calibration_done);
+    connect(worker_, &CalibrationWorker::export_done,
+            this, &CalibrationWizard::on_export_done);
 
-    auto* close_box = new QDialogButtonBox(QDialogButtonBox::Close, this);
-    connect(close_box, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    layout->addWidget(close_box);
-
-    capture_timer_ = new QTimer(this);
-    capture_timer_->setTimerType(Qt::PreciseTimer);
-    capture_timer_->setInterval(kCaptureTimerMs);
-    connect(capture_timer_, &QTimer::timeout, this, &CalibrationWizard::on_capture_tick);
+    configure_worker();
 }
 
 CalibrationWizard::~CalibrationWizard() {
-    if (capturing_) on_stop_capture();
+    if (camera_timer_) camera_timer_->stop();
+    // Safety net: hideEvent normally restores the override, but if the app
+    // exits with the wizard still open no hideEvent fires.
+    restore_auto_bias_override();
+    if (camera_) camera_->set_cd_broadcast(false);
+    teardown_worker();
 }
 
 void CalibrationWizard::set_camera(CameraController* controller) {
     camera_ = controller;
     tap_.attach(controller);
-    const bool has_camera = (camera_ != nullptr && camera_->is_connected());
-    in_start_btn_->setEnabled(has_camera);
+    enable_capture(controller && controller->is_connected() && !capture_done_);
 }
 
 void CalibrationWizard::set_display(EventDisplayWidget* display) {
@@ -85,355 +276,705 @@ void CalibrationWizard::set_display(EventDisplayWidget* display) {
 }
 
 void CalibrationWizard::show_intrinsic() {
-    tabs_->setCurrentIndex(0);
-    rebuild_screen_combo();
+    // Size the window to (nearly) the full workarea but INSET by a few px so it
+    // does NOT exactly match the workarea. This is the root-cause fix for the
+    // calibration preview stutter.
+    //
+    // What happens without the inset: a window whose geometry matches the
+    // workarea is treated by Mutter (GNOME) as maximized — it is unredirected
+    // (direct-scanout) and/or put on the maximized compositing frame-sync path.
+    // That path throttles the 30 Hz camera preview → visible stutter. A/B
+    // testing proved the trigger is purely geometric (size/coverage-driven,
+    // NOT content-driven): solid-disc and waffle patterns stutter IDENTICALLY
+    // at near-full-workarea size, and BOTH become smooth when the window is
+    // dragged clearly smaller. The coverage threshold is coarser than a few px
+    // (a 5 px/side inset was NOT enough — see kFullscreenGuardInset). The GUI
+    // thread itself is fine (it paints at a steady 30 Hz); the stall is in the
+    // compositor's presentation of the window.
+    //
+    // Why not _NET_WM_BYPASS_COMPOSITOR=0? GNOME-50 Mutter no longer honors
+    // that X11 hint (it was tried and had zero effect). Why not showMaximized()?
+    // That sets Qt::WindowMaximized, which is exactly the state to avoid. The
+    // geometric inset is compositor-independent: a normal-state window that
+    // doesn't match the workarea gets normal compositing on Mutter, KWin, Xorg,
+    // and XWayland alike. The changeEvent below keeps it that way even if the
+    // user triggers a maximize via the keyboard or drag-to-top edge-tiling.
+    if (QScreen* screen = QGuiApplication::primaryScreen()) {
+        QRect g = screen->availableGeometry();
+        g.adjust(kFullscreenGuardInset, kFullscreenGuardInset,
+                 -kFullscreenGuardInset, -kFullscreenGuardInset);
+        setGeometry(g);
+    }
     show();
     raise();
     activateWindow();
-}
-
-// ---------------------------------------------------------------------------
-// Intrinsic tab
-// ---------------------------------------------------------------------------
-
-void CalibrationWizard::build_intrinsic_tab() {
-    auto* page = new QWidget(this);
-    auto* outer = new QVBoxLayout(page);
-
-    // Configuration form.
-    auto* form = new QFormLayout();
-
-    in_screen_ = new QComboBox(page);
-    form->addRow(tr("Target screen"), in_screen_);
-
-    in_cols_ = new QSpinBox(page);
-    in_cols_->setRange(2, 30);
-    in_cols_->setValue(9);
-    in_rows_ = new QSpinBox(page);
-    in_rows_->setRange(2, 30);
-    in_rows_->setValue(6);
-    auto* dims_row = new QWidget(page);
-    auto* dims_layout = new QHBoxLayout(dims_row);
-    dims_layout->setContentsMargins(0, 0, 0, 0);
-    dims_layout->addWidget(new QLabel(tr("Cols:"), dims_row));
-    dims_layout->addWidget(in_cols_);
-    dims_layout->addWidget(new QLabel(tr("Rows:"), dims_row));
-    dims_layout->addWidget(in_rows_);
-    dims_layout->addStretch();
-    form->addRow(tr("Inner corners"), dims_row);
-
-    in_target_frames_ = new QSpinBox(page);
-    in_target_frames_->setRange(5, 100);
-    in_target_frames_->setValue(30);
-    form->addRow(tr("Target frames"), in_target_frames_);
-
-    in_mse_threshold_ = new QDoubleSpinBox(page);
-    in_mse_threshold_->setRange(0.0, 10000.0);
-    in_mse_threshold_->setDecimals(1);
-    in_mse_threshold_->setValue(kDefaultMseThreshold);
-    in_mse_threshold_->setToolTip(tr("Frames with MSE below this vs. the last "
-        "accepted frame are rejected as duplicates (same pose)."));
-    form->addRow(tr("Duplicate MSE"), in_mse_threshold_);
-
-    outer->addLayout(form);
-
-    // Buttons.
-    auto* btn_row = new QHBoxLayout();
-    in_show_board_btn_ = new QPushButton(tr("Show Chessboard"), page);
-    in_start_btn_      = new QPushButton(tr("Start Auto-Capture"), page);
-    in_stop_btn_       = new QPushButton(tr("Stop"), page);
-    in_reset_btn_      = new QPushButton(tr("Reset"), page);
-    in_save_btn_       = new QPushButton(tr("Export..."), page);
-    in_stop_btn_->setEnabled(false);
-    in_save_btn_->setEnabled(false);
-    btn_row->addWidget(in_show_board_btn_);
-    btn_row->addWidget(in_start_btn_);
-    btn_row->addWidget(in_stop_btn_);
-    btn_row->addWidget(in_reset_btn_);
-    btn_row->addWidget(in_save_btn_);
-    btn_row->addStretch();
-    outer->addLayout(btn_row);
-
-    // Progress bar.
-    in_progress_ = new QProgressBar(page);
-    in_progress_->setRange(0, in_target_frames_->value());
-    in_progress_->setValue(0);
-    outer->addWidget(in_progress_);
-
-    // Preview area.
-    in_preview_area_ = new QScrollArea(page);
-    in_preview_area_->setAlignment(Qt::AlignCenter);
-    in_preview_label_ = new QLabel(in_preview_area_);
-    in_preview_label_->setText(tr("No frames captured yet."));
-    in_preview_area_->setWidget(in_preview_label_);
-    in_preview_area_->setMinimumHeight(220);
-    outer->addWidget(in_preview_area_, 1);
-
-    in_status_ = new QLabel(tr("Idle. Click 'Show Chessboard' then 'Start Auto-Capture'."), page);
-    in_status_->setWordWrap(true);
-    outer->addWidget(in_status_);
-
-    connect(in_show_board_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_show_chessboard);
-    connect(in_start_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_start_capture);
-    connect(in_stop_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_stop_capture);
-    connect(in_reset_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_intrinsic_reset);
-    connect(in_save_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_intrinsic_save);
-    connect(in_target_frames_, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [this](int v) { in_progress_->setRange(0, v); });
-
-    // Apply initial configuration.
-    on_intrinsic_reset();
-
-    tabs_->addTab(page, tr("Intrinsic"));
-}
-
-void CalibrationWizard::rebuild_screen_combo() {
-    if (!in_screen_) return;
-    in_screen_->clear();
-    in_screen_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
-    const auto screens = QGuiApplication::screens();
-    for (int i = 0; i < screens.size(); ++i) {
-        QScreen* s = screens[i];
-        const QRect g = s->geometry();
-        const QString label = tr("Screen %1: %2×%3")
-            .arg(i + 1).arg(g.width()).arg(g.height());
-        in_screen_->addItem(label, QVariant::fromValue(s));
+    camera_timer_->start();
+    // Start streaming CD events into the tap so a Space press has a recent
+    // 100000 µs window to grab.
+    if (camera_ && camera_->is_connected()) {
+        tap_.clear();
+        camera_->set_cd_broadcast(true);
     }
 }
 
-void CalibrationWizard::on_show_chessboard() {
-    QScreen* target = in_screen_->currentData().value<QScreen*>();
-    if (!target) target = QGuiApplication::primaryScreen();
-    if (!chessboard_) {
-        chessboard_ = new ChessboardDisplay(this);
-        // WA_DeleteOnClose would null chessboard_ on close; we want to reuse
-        // the same instance across Show/Hide clicks, so leave it owned by
-        // 'this' and just show/hide.
-        connect(chessboard_, &ChessboardDisplay::destroyed, this, [this]() {
-            chessboard_ = nullptr;
-        });
+void CalibrationWizard::changeEvent(QEvent* event) {
+    QDialog::changeEvent(event);
+    // Block ANY transition into Qt::WindowMaximized (title-bar double-click,
+    // Super+Up, GNOME drag-to-top edge-tiling — the maximize button itself is
+    // already removed via window flags, but those other paths bypass it). A
+    // maximized window covers the full workarea → Mutter unredirects it →
+    // camera preview stutters (see show_intrinsic). Immediately undo the
+    // maximize and re-apply the inset workarea geometry, so the window LOOKS
+    // maximized yet stays on the smooth normal compositing path.
+    //
+    // Deferred via QueuedConnection so the current state-change event finishes
+    // first — calling setWindowState re-entrantly inside changeEvent is fragile.
+    // Our own setWindowState fires a second changeEvent in which the window is
+    // no longer maximized, so the guard below falls through (no loop). The WM
+    // processes the un-maximize then our setGeometry in order.
+    if (event->type() == QEvent::WindowStateChange &&
+        (windowState() & Qt::WindowMaximized)) {
+        QMetaObject::invokeMethod(this, [this] {
+            setWindowState(windowState() & ~Qt::WindowMaximized);
+            if (QScreen* screen = QGuiApplication::primaryScreen()) {
+                QRect g = screen->availableGeometry();
+                g.adjust(kFullscreenGuardInset, kFullscreenGuardInset,
+                         -kFullscreenGuardInset, -kFullscreenGuardInset);
+                setGeometry(g);
+            }
+        }, Qt::QueuedConnection);
     }
-    chessboard_->set_pattern(in_cols_->value(), in_rows_->value());
-    chessboard_->attach_to_screen(target);
-    // Fullscreen by default — the board must fill the screen so the camera
-    // can see the whole pattern. User can press F to toggle windowed mode.
-    chessboard_->showFullScreen();
-    chessboard_->raise();
-    chessboard_->start_flicker();
 }
 
-void CalibrationWizard::on_start_capture() {
-    if (!camera_ || !camera_->is_connected()) {
-        QMessageBox::warning(this, tr("Calibration"), tr("No camera connected."));
-        return;
-    }
-    if (capturing_) return;
-    // Auto-show the chessboard if the user hasn't yet — without it,
-    // square_size_mm is unknown (no DPI geometry) and no flip bursts are
-    // generated, so capture would produce garbage.
-    if (!chessboard_) {
-        on_show_chessboard();
-        if (!chessboard_) {
-            QMessageBox::warning(this, tr("Calibration"),
-                tr("Could not display the chessboard. Cannot start capture."));
-            return;
-        }
-    }
-    // Refresh detector config from current controls.
-    intrinsic_->set_pattern(gui_algo::CalibrationPattern::Chessboard,
-                            in_cols_->value(), in_rows_->value(),
-                            chessboard_->square_size_mm());
-    intrinsic_->reset();
-    intrinsic_result_ = {};
-    last_accepted_gray_ = cv::Mat();
-    in_last_preview_ = QImage();
-    in_preview_label_->clear();
-    in_preview_label_->setText(tr("Capturing..."));
-    in_progress_->setRange(0, in_target_frames_->value());
-    in_progress_->setValue(0);
-
-    // Enable CD broadcast so the tap receives batches.
-    tap_.clear();
-    camera_->set_cd_broadcast(true);
-    capturing_ = true;
-    capture_timer_->start();
-    in_start_btn_->setEnabled(false);
-    in_stop_btn_->setEnabled(true);
-    in_save_btn_->setEnabled(false);
-    set_status(tr("Capturing — point the camera at the chessboard from multiple angles..."));
-}
-
-void CalibrationWizard::on_stop_capture() {
-    if (!capturing_) return;
-    capture_timer_->stop();
-    capturing_ = false;
+void CalibrationWizard::hideEvent(QHideEvent* event) {
+    if (camera_timer_) camera_timer_->stop();
+    restore_auto_bias_override();
     if (camera_) camera_->set_cd_broadcast(false);
-    in_start_btn_->setEnabled(true);
-    in_stop_btn_->setEnabled(false);
-    set_status(tr("Capture stopped. Captured %1 frames.")
-        .arg(intrinsic_->frame_count()));
+    QDialog::hideEvent(event);
 }
 
-void CalibrationWizard::on_capture_tick() {
-    if (!capturing_) return;
-    std::vector<Metavision::EventCD> best;
-    const std::size_t n = tap_.drain_and_pick_max_window(kWindowUs, kSpanUs, best);
-    if (n == 0 || best.empty()) {
-        set_status(tr("No events in this cycle. Point the camera at the chessboard."));
+void CalibrationWizard::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    // Mirror hideEvent(): whenever the window becomes visible again, restart
+    // the aim-view poll and CD broadcast. Without this, any hide→show cycle
+    // (minimize→restore, workspace switch, WM state transition) leaves the
+    // preview frozen on its last message — e.g. a stale "No camera connected"
+    // from before the camera was started in the main window, even though the
+    // main display is now streaming fine. QTimer::start() is harmless if the
+    // timer is already running (it just resets the interval); if no camera is
+    // connected, on_camera_tick reports that state on the next tick.
+    if (camera_timer_) camera_timer_->start();
+    if (camera_ && camera_->is_connected()) {
+        apply_auto_bias_override();
+        tap_.clear();
+        camera_->set_cd_broadcast(true);
+    }
+}
+
+void CalibrationWizard::apply_auto_bias_override() {
+    // Auto Bias for the wizard session (2026-08-23, replaces the diff-bias
+    // max-out override): while the wizard is open the camera-level Auto Bias
+    // controller keeps the total event rate inside the scaled [19, 20] Mev/s
+    // band by adjusting bias_diff_on/off on-sensor. The blink-capture window then sees a
+    // dense-but-bounded stream no matter how strong the LCD backlight-PWM
+    // noise floor is (the old fixed "both biases to max" was a blunt hammer
+    // and left the rate wherever the sensor settled). The controller's
+    // BiasApplier snapshots the register values on enable and restores them
+    // on disable, so the pre-wizard biases always come back; we additionally
+    // snapshot/restore the controller's rate band.
+    if (!camera_ || !camera_->is_connected() || camera_->is_file_source() ||
+        auto_bias_override_active_) {
+        return;
+    }
+    float lo = 0.F, hi = 0.F;
+    camera_->auto_bias_rate_bounds(lo, hi);
+    // The band was tuned for the 1280×720 reference sensor; scale it with
+    // the connected camera's pixel count so every resolution sees the same
+    // per-pixel event density (a 640×480 camera gets a third of the rate).
+    const auto& info = camera_->sensor_info();
+    const float pixels = (info.width > 0 && info.height > 0)
+                             ? static_cast<float>(info.width) *
+                               static_cast<float>(info.height)
+                             : 1280.0F * 720.0F;
+    const float scale = pixels / (1280.0F * 720.0F);
+    if (!camera_->set_auto_bias_rate_bounds(kCalibrationRateMinMev * scale,
+                                            kCalibrationRateMaxMev * scale)) {
+        return;
+    }
+    if (!camera_->set_auto_bias_enabled(true)) {
+        // Sensor without diff biases or other refusal — keep the band as
+        // it was.
+        camera_->set_auto_bias_rate_bounds(lo, hi);
+        return;
+    }
+    saved_auto_bias_lo_ = lo;
+    saved_auto_bias_hi_ = hi;
+    auto_bias_override_active_ = true;
+    emit biases_changed_externally();
+}
+
+void CalibrationWizard::restore_auto_bias_override() {
+    if (!auto_bias_override_active_) return;
+    auto_bias_override_active_ = false;
+    if (camera_ && camera_->is_connected()) {
+        // Disabling restores the register snapshot taken at enable (the
+        // pre-wizard bias values) via BiasApplier::restore().
+        camera_->set_auto_bias_enabled(false);
+        camera_->set_auto_bias_rate_bounds(saved_auto_bias_lo_,
+                                           saved_auto_bias_hi_);
+    }
+    emit biases_changed_externally();
+}
+
+void CalibrationWizard::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
+        event->accept();
+        on_capture_pressed();
+        return;
+    }
+    QDialog::keyPressEvent(event);
+}
+
+void CalibrationWizard::on_camera_tick() {
+    if (!display_ || !camera_) return;
+    // Three-state aim-view driven by the real camera state, NOT by
+    // current_frame().isNull() — that is also null for a connected-but-not-
+    // started camera and during the first-frame race, which previously showed
+    // a misleading "No camera connected".
+    if (!camera_->is_connected()) {
+        camera_view_->set_message(tr("No camera connected"));
+        return;
+    }
+    if (!camera_->is_running()) {
+        camera_view_->set_message(tr("Camera connected — press Start to stream"));
+        return;
+    }
+    const QImage frame = display_->current_frame();
+    if (frame.isNull()) {
+        camera_view_->set_message(tr("Waiting for first frame…"));
+        return;
+    }
+    camera_view_->set_frame(frame);
+}
+
+void CalibrationWizard::on_capture_pressed() {
+    // Note: do NOT guard on !capture_btn_->isEnabled() — the button is disabled
+    // when no camera is connected, but Space should still surface the popup so
+    // the user learns the prerequisite. capture_in_flight_/capture_done_ guard
+    // the actual one-at-a-time / target-reached cases.
+    if (capture_in_flight_ || capture_done_) return;
+    if (!camera_ || !camera_->is_connected()) {
+        // Modal popup (not just a status line) so the user knows the
+        // prerequisite. GUI is all-English.
+        QMessageBox::information(this, tr("Camera not connected"),
+            tr("No camera is connected. Please connect a camera in the main window first."));
+        return;
+    }
+    if (!camera_->is_running()) {
+        QMessageBox::information(this, tr("Camera not running"),
+            tr("Camera is not running. Please start the camera in the main window first."));
         return;
     }
 
-    // Determine sensor dimensions: prefer the camera's sensor_info, fall
-    // back to the display's current frame size.
-    int sensor_w = 0, sensor_h = 0;
-    if (camera_) {
-        sensor_w = camera_->sensor_info().width;
-        sensor_h = camera_->sensor_info().height;
+    std::vector<Metavision::EventCD> evs;
+    const Metavision::timestamp window_us = capture_window_->value();
+    const std::size_t n = tap_.drain_last_window(window_us, evs);
+    if (n == 0 || evs.empty()) {
+        set_status(tr("No events in the last %1 µs — wait for the chessboard to blink.")
+            .arg(window_us));
+        return;
     }
-    if (sensor_w <= 0 || sensor_h <= 0) {
+
+    const int sw = camera_->sensor_info().width;
+    const int sh = camera_->sensor_info().height;
+    if (sw <= 0 || sh <= 0) {
         set_status(tr("Sensor geometry unknown."));
         return;
     }
 
-    // Render the 1 ms window to a grayscale frame.
-    cv::Mat gray = render_event_window(best, sensor_w, sensor_h);
-    auto res = intrinsic_->add_frame(gray, true);
+    // Accumulate per-polarity event counts and hand them to the worker. The
+    // worker owns the blink-frame parameters and derives the count threshold
+    // adaptively, so a capture can be re-judged without re-reading events.
+    BlinkCapture capture;
+    gui_algo::accumulate_blink_counts(evs.data(), evs.data() + evs.size(),
+                                      sw, sh, capture.on_cnt, capture.off_cnt);
 
-    if (!res.found) {
-        set_status(tr("Rejected — chessboard not detected (%1 events).").arg(n));
+    capture_in_flight_ = true;
+    // Serialize captures: disable the button while the worker detects; on
+    // accept/reject it is re-enabled. This makes the one-at-a-time flow
+    // visible and prevents rapid clicks piling up.
+    capture_btn_->setEnabled(false);
+    // "Delete this capture" is also blocked while a frame is in flight — the
+    // last accepted frame's preview is still shown, but deleting it mid-
+    // judgment of the next frame would race the worker's accept/remove queue.
+    update_delete_enabled();
+    set_status(tr("Detecting (%1 events)…").arg(n));
+    emit process_capture_requested(capture);
+}
+
+void CalibrationWizard::on_frame_accepted(QImage annotated,
+                                          std::size_t accepted, std::size_t target,
+                                          QVector<QPointF> points) {
+    capture_in_flight_ = false;
+    progress_->setRange(0, static_cast<int>(target));
+    progress_->setValue(static_cast<int>(accepted));
+    // Keep a preview stack parallel to the worker's image_points_ so a delete
+    // can revert the preview to the now-last capture. Push even when annotated
+    // is null (annotation can fail) so the stack stays in lock-step with the
+    // accepted count — show_last_preview() handles a null top gracefully.
+    captured_previews_.push_back(annotated);
+    // Same lock-step for the coverage overlay's point stack.
+    std::vector<cv::Point2f> view;
+    view.reserve(static_cast<std::size_t>(points.size()));
+    for (const auto& p : points) {
+        view.emplace_back(static_cast<float>(p.x()), static_cast<float>(p.y()));
+    }
+    captured_points_.push_back(std::move(view));
+    update_coverage_overlay();
+    show_last_preview();
+    // The just-accepted frame is now the deletable "last capture". capture_done_
+    // (set by on_capture_complete when the target is reached) clears this via
+    // update_delete_enabled() — so delete is only available before the final
+    // set is locked in.
+    can_delete_last_ = true;
+    set_status(tr("Captured %1 / %2 frames.").arg(accepted).arg(target));
+    // Judgment done — re-enable capture for the next shot (capture_complete
+    // disables it for good once the target is reached).
+    if (!capture_done_) enable_capture(camera_ && camera_->is_connected());
+    update_delete_enabled();
+}
+
+void CalibrationWizard::on_frame_rejected(QString reason) {
+    capture_in_flight_ = false;
+    QString msg = tr("Rejected — %1").arg(reason);
+    // Signal-quality failures only: suggest the two physical remedies
+    // (stronger blink contrast / less LCD PWM noise). Duplicate-pose and
+    // coverage rejections are not signal problems — no tip there.
+    if (!reason.contains(QLatin1String("Duplicate pose")) &&
+        !reason.contains(QLatin1String("Coverage"))) {
+        msg += tr(" Tip: maximize screen brightness or adjust bias_diff_on/off.");
+    }
+    set_status(msg);
+    if (!capture_done_) enable_capture(camera_ && camera_->is_connected());
+    update_delete_enabled();
+}
+
+void CalibrationWizard::on_delete_capture() {
+    // One delete per accept: drop the flag immediately so a second click (or a
+    // rapid double-click) cannot remove the prior capture. The worker's
+    // remove_last_frame is queued and will confirm via frame_deleted, at which
+    // point the progress bar and preview are rolled back to match.
+    if (!can_delete_last_) return;
+    can_delete_last_ = false;
+    update_delete_enabled();
+    set_status(tr("Discarding last capture…"));
+    emit delete_last_capture_requested();
+}
+
+void CalibrationWizard::on_frame_deleted(std::size_t remaining) {
+    // Worker confirmed the last observation was removed. Roll back the progress
+    // bar to its authoritative count and pop the parallel preview stack so the
+    // preview reverts to the now-last capture (or the placeholder if empty).
+    progress_->setValue(static_cast<int>(remaining));
+    if (!captured_previews_.empty()) captured_previews_.pop_back();
+    if (!captured_points_.empty()) captured_points_.pop_back();
+    update_coverage_overlay();
+    show_last_preview();
+    if (remaining > 0) {
+        set_status(tr("Last capture discarded. %1 frame(s) remain.").arg(remaining));
+    } else {
+        set_status(tr("Last capture discarded. No frames remain."));
+    }
+    update_delete_enabled();
+}
+
+void CalibrationWizard::on_capture_complete(std::size_t accepted) {
+    capture_in_flight_ = false;
+    capture_done_ = true;
+    enable_capture(false);
+    // Target reached → calibration is running on the worker. Deleting now would
+    // not affect the already-computed result, so block it. The user must Reset
+    // (which clears the preview stack and can_delete_last_) to start over.
+    can_delete_last_ = false;
+    update_delete_enabled();
+    if (square_mm_->value() <= 0.0) {
+        // Square size still at its "not measured" default — calibrating with
+        // it would be degenerate (every object point collapses to the
+        // origin). Keep the captures: entering the measured value triggers
+        // the calibration via on_square_size_changed.
+        set_status(tr("Captured %1 frames. Measure one chessboard square "
+                      "edge, enter it as the Square size, and the calibration "
+                      "will run.").arg(accepted));
         return;
     }
+    // Run the two-pass cv::calibrateCamera on the worker thread.
+    set_status(tr("Captured %1 frames. Running calibration…").arg(accepted));
+    emit run_calibration_requested();
+}
 
-    // Duplicate check via MSE vs last accepted frame.
-    if (!last_accepted_gray_.empty()) {
-        const double m = mse_gray(gray, last_accepted_gray_);
-        if (m < in_mse_threshold_->value()) {
-            set_status(tr("Rejected — duplicate pose (MSE=%1 < %2). Move the camera.")
-                .arg(m, 0, 'f', 1).arg(in_mse_threshold_->value(), 0, 'f', 1));
-            return;
-        }
-    }
-
-    // Accept: store the grayscale for future MSE comparison, update preview.
-    last_accepted_gray_ = gray.clone();
-    in_last_preview_ = cv_to_qimage(res.image);
-    update_intrinsic_preview(in_last_preview_);
-    const std::size_t got = intrinsic_->frame_count();
-    in_progress_->setValue(static_cast<int>(got));
-    set_status(tr("Captured %1 / %2 frames (last: %3 events).")
-        .arg(got).arg(in_target_frames_->value()).arg(n));
-
-    if (static_cast<int>(got) >= in_target_frames_->value()) {
-        // Auto-end: stop capture and run calibration.
-        on_stop_capture();
-        set_status(tr("Capture complete. Running calibration..."));
-        QApplication::processEvents();
-        intrinsic_result_ = intrinsic_->run();
-        if (intrinsic_result_.ok) {
-            set_status(tr("Calibration OK. RMS = %1 px (%2 frames). Click Export to save.")
-                .arg(intrinsic_result_.rms, 0, 'f', 3)
-                .arg(intrinsic_result_.frames_used));
-            in_save_btn_->setEnabled(true);
-        } else {
-            QMessageBox::warning(this, tr("Calibration failed"),
-                QString::fromStdString(intrinsic_result_.error));
-            set_status(tr("Calibration failed: %1")
-                .arg(QString::fromStdString(intrinsic_result_.error)));
-        }
+void CalibrationWizard::on_calibration_done(bool ok, double rms, int frames_used,
+                                            int removed_frames, QString error) {
+    // A result delivered after the session was torn down (Reset, or a
+    // capture_window/target edit — both reset the worker) is stale: runs are
+    // only launched while capture_done_ is true, so a delivery while it is
+    // false belongs to a session the user discarded. Re-enabling Export or
+    // popping its warning would offer a result that no longer exists (the
+    // worker's cached result survives reset()).
+    if (!capture_done_) return;
+    if (ok) {
+        set_status(tr("Calibration OK. RMS = %1 px (%2 kept, %3 removed). "
+                      "Click Export to save.")
+            .arg(rms, 0, 'f', 3).arg(frames_used).arg(removed_frames));
+        export_btn_->setEnabled(true);
+    } else {
+        QMessageBox::warning(this, tr("Calibration failed"), error);
+        set_status(tr("Calibration failed: %1").arg(error));
     }
 }
 
-void CalibrationWizard::on_intrinsic_reset() {
-    if (capturing_) on_stop_capture();
-    intrinsic_->set_pattern(gui_algo::CalibrationPattern::Chessboard,
-                            in_cols_->value(), in_rows_->value(),
-                            chessboard_ ? chessboard_->square_size_mm() : 25.0f);
-    intrinsic_->reset();
-    intrinsic_result_ = {};
-    last_accepted_gray_ = cv::Mat();
-    in_last_preview_ = QImage();
-    in_preview_label_->clear();
-    in_preview_label_->setText(tr("No frames captured yet."));
-    in_progress_->setRange(0, in_target_frames_->value());
-    in_progress_->setValue(0);
-    in_save_btn_->setEnabled(false);
-    set_status(tr("Idle. Click 'Show Chessboard' then 'Start Auto-Capture'."));
-}
-
-QString CalibrationWizard::default_export_path() const {
-    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-    const QString base = docs.isEmpty() ? QDir::homePath() : docs;
-    // Stable filename (no timestamp) so the default matches the Preprocessor
-    // undistort path exactly — the user can rely on both defaults pointing at
-    // the same file. QFileDialog prompts for overwrite if it already exists.
-    return base + "/EBplus/calibration/intrinsic.yml";
-}
-
-void CalibrationWizard::on_intrinsic_save() {
-    if (!intrinsic_result_.ok) return;
+void CalibrationWizard::on_export_pressed() {
+    // Guard the "not measured" default: a calibration exported without a real
+    // square size has no meaningful world scale. Remind on EVERY export click
+    // while the value is 0; the dialog's single OK button just closes it and
+    // the export is not attempted.
+    if (square_mm_->value() <= 0.0) {
+        QMessageBox::information(this, tr("Square size not set"),
+            tr("The square size is 0. Measure the length of one chessboard "
+               "square edge with a ruler, enter the value (mm) in the Square "
+               "size field, then export again."));
+        return;
+    }
+    // Create the default parent directory BEFORE opening the dialog: it does
+    // not exist until the first export (the worker auto-mkdirs on save), and
+    // QFileDialog resolves a non-existent directory to the CURRENT WORKING
+    // DIRECTORY — so the very first export would otherwise default to
+    // <launch-dir>/intrinsic.yml (e.g. the build directory) instead of the
+    // shared default, diverging from the undistort preprocessor's path.
+    QDir().mkpath(QFileInfo(default_export_path()).absolutePath());
     const QString path = QFileDialog::getSaveFileName(
         this, tr("Save Intrinsic Calibration"),
         default_export_path(),
         tr("YAML (*.yml *.yaml);;All Files (*)"));
     if (path.isEmpty()) return;
-    try {
-        cv::FileStorage fs(path.toStdString(), cv::FileStorage::WRITE);
-        if (!fs.isOpened()) throw std::runtime_error("Cannot open file");
-        fs << "image_width"  << intrinsic_->image_size().width;
-        fs << "image_height" << intrinsic_->image_size().height;
-        fs << "camera_matrix" << intrinsic_result_.K;
-        fs << "distortion_coefficients" << intrinsic_result_.dist_coeffs;
-        fs << "rms" << intrinsic_result_.rms;
-        fs.release();
-        set_status(tr("Saved to %1").arg(path));
-    } catch (const std::exception& e) {
-        QMessageBox::warning(this, tr("Save failed"), e.what());
+    set_status(tr("Exporting to %1…").arg(path));
+    emit export_requested(path);
+}
+
+void CalibrationWizard::on_export_done(bool ok, QString message) {
+    if (ok) {
+        set_status(tr("Saved to %1").arg(message));
+    } else {
+        QMessageBox::warning(this, tr("Save failed"), message);
+        set_status(tr("Export failed: %1").arg(message));
     }
 }
 
-void CalibrationWizard::update_intrinsic_preview(const QImage& img) {
-    if (img.isNull()) return;
-    in_preview_label_->setPixmap(QPixmap::fromImage(img).scaledToWidth(
-        in_preview_area_->viewport()->width(), Qt::SmoothTransformation));
-    in_preview_label_->resize(in_preview_label_->pixmap().size());
+void CalibrationWizard::on_intrinsic_reset() {
+    capture_in_flight_ = false;
+    capture_done_ = false;
+    can_delete_last_ = false;
+    captured_previews_.clear();
+    captured_points_.clear();
+    update_coverage_overlay();
+    progress_->setValue(0);
+    preview_label_->clear();
+    preview_label_->setText(tr("No frames captured yet."));
+    export_btn_->setEnabled(false);
+    // Reset the worker's accumulated observations (queued).
+    QMetaObject::invokeMethod(worker_, "reset", Qt::QueuedConnection);
+    enable_capture(camera_ && camera_->is_connected());
+    update_delete_enabled();
+    set_status(tr("Point the camera at the blinking chessboard and press Space to capture."));
+}
+
+void CalibrationWizard::on_config_changed() {
+    apply_pattern_to_display();
+    configure_worker();
+    // Geometry change invalidates accumulated observations — reset the view.
+    capture_in_flight_ = false;
+    capture_done_ = false;
+    can_delete_last_ = false;
+    captured_previews_.clear();
+    captured_points_.clear();
+    update_coverage_overlay();
+    progress_->setValue(0);
+    preview_label_->clear();
+    preview_label_->setText(tr("No frames captured yet."));
+    export_btn_->setEnabled(false);
+    QMetaObject::invokeMethod(worker_, "reset", Qt::QueuedConnection);
+    enable_capture(camera_ && camera_->is_connected());
+    update_delete_enabled();
 }
 
 void CalibrationWizard::set_status(const QString& text) {
-    if (in_status_) in_status_->setText(text);
+    if (status_) status_->setText(text);
 }
 
-QImage CalibrationWizard::cv_to_qimage(const cv::Mat& mat) {
-    if (mat.empty()) return QImage();
-    cv::Mat rgb;
-    if (mat.channels() == 1) {
-        cv::cvtColor(mat, rgb, cv::COLOR_GRAY2RGB);
-    } else {
-        cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
+void CalibrationWizard::enable_capture(bool on) {
+    capture_btn_->setEnabled(on);
+    capture_btn_->setToolTip(on ? QString() :
+        tr("Connect a camera first, then press Space to capture."));
+}
+
+void CalibrationWizard::update_delete_enabled() {
+    // Enabled only when the last accept has not been deleted, no capture is in
+    // flight, and the target has not been reached. This enforces the contract:
+    // one delete per capture, before the final set is locked in. A second
+    // consecutive delete (can_delete_last_ == false) is blocked here, so it can
+    // never reach the worker to drop the prior capture.
+    const bool on = can_delete_last_ && !capture_in_flight_ && !capture_done_;
+    delete_capture_btn_->setEnabled(on);
+}
+
+void CalibrationWizard::update_coverage_overlay() {
+    int sw = 0, sh = 0;
+    if (camera_) {
+        const auto& info = camera_->sensor_info();
+        sw = info.width;
+        sh = info.height;
     }
-    return QImage(rgb.data, rgb.cols, rgb.rows,
-                  static_cast<int>(rgb.step), QImage::Format_RGB888).copy();
+    camera_view_->set_coverage_overlay(
+        compute_coverage_overlay(captured_points_, sw, sh), captured_points_);
 }
 
-cv::Mat CalibrationWizard::render_event_window(
-    const std::vector<Metavision::EventCD>& evs, int sensor_w, int sensor_h) {
-    cv::Mat gray(sensor_h, sensor_w, CV_8UC1, cv::Scalar(128));
-    // ON (p=1) → white (255), OFF (p=0) → black (0). Background grey (128)
-    // so the chessboard pattern stands out for cv::findChessboardCorners.
-    for (const auto& ev : evs) {
-        if (ev.x < 0 || ev.x >= sensor_w || ev.y < 0 || ev.y >= sensor_h) continue;
-        gray.ptr<uchar>(ev.y)[ev.x] = ev.p ? 255 : 0;
+void CalibrationWizard::show_last_preview() {
+    // Render the top of the preview stack (the current last-accepted capture)
+    // scaled to the scroll-area width, or the placeholder when empty/null.
+    // QImage is implicitly shared, so QPixmap::fromImage makes the only deep
+    // copy needed for display.
+    if (captured_previews_.empty() || captured_previews_.back().isNull()) {
+        preview_label_->clear();
+        preview_label_->setText(tr("No frames captured yet."));
+        return;
     }
-    return gray;
+    const QImage& img = captured_previews_.back();
+    // Fit the WHOLE frame inside the viewport (both dimensions, aspect kept):
+    // fitting only the width lets a wide frame's height overflow the column,
+    // which is what brought up the scroll area's vertical scrollbar.
+    const QSize avail = preview_area_->viewport()->size().expandedTo({1, 1});
+    const QPixmap pm = QPixmap::fromImage(img).scaled(
+        avail, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    preview_label_->setPixmap(pm);
+    preview_label_->resize(pm.size());
 }
 
-double CalibrationWizard::mse_gray(const cv::Mat& a, const cv::Mat& b) {
-    if (a.size() != b.size() || a.type() != b.type()) return 1e9;
-    cv::Mat diff;
-    cv::absdiff(a, b, diff);
-    diff.convertTo(diff, CV_64F);
-    diff = diff.mul(diff);
-    cv::Scalar s = cv::sum(diff);
-    return s[0] / static_cast<double>(a.total());
+bool CalibrationWizard::eventFilter(QObject* watched, QEvent* event) {
+    // Re-fit the captured preview to the preview area on resize — the stored
+    // captures are full-resolution, so this is just a re-scale of the top
+    // pixmap, not a re-render.
+    if (watched == preview_area_->viewport() &&
+        event->type() == QEvent::Resize && !captured_previews_.empty()) {
+        show_last_preview();
+    }
+    return QDialog::eventFilter(watched, event);
+}
+
+void CalibrationWizard::apply_pattern_to_display() {
+    if (pattern_) {
+        pattern_->set_pattern(kGridCols, kGridRows);
+        pattern_->set_square_size_mm(static_cast<float>(square_mm_->value()));
+    }
+}
+
+void CalibrationWizard::configure_worker() {
+    emit configure_requested(square_mm_->value(),
+                             target_frames_->value());
+}
+
+void CalibrationWizard::on_square_size_changed() {
+    // Square size is a pure world-scale factor: the accepted captures are
+    // pixel observations and stay valid when it changes, so ONLY the value is
+    // propagated here — no reset, no clearing of previews/progress (unlike
+    // on_config_changed, which handles the geometry-affecting parameters).
+    // The worker's solver rebuilds its object grids from the current value at
+    // run() time, so the final calibration always uses the latest entry.
+    apply_pattern_to_display();
+    configure_worker();
+    // Frames are all captured but the calibration ran before this change (or
+    // was deferred because the value was still 0): re-run it so the result
+    // and the export reflect the new value. Queued after the configure above
+    // (same worker thread → in-order delivery). Passing through 0 (clearing
+    // the field, down-arrow while re-entering the measurement) must NOT hit
+    // the solver's 0-guard — that would pop a "Calibration failed" modal in
+    // the middle of an ordinary edit — so a 0 value defers exactly like
+    // on_capture_complete does, and a later non-zero entry re-runs.
+    if (capture_done_) {
+        if (square_mm_->value() > 0.0) {
+            emit run_calibration_requested();
+        } else {
+            set_status(tr("Measure one chessboard square edge, enter it as "
+                          "the Square size, and the calibration will run."));
+        }
+    }
+}
+
+QString CalibrationWizard::default_export_path() const {
+    // Single source of truth shared with the Preprocessor undistort default
+    // (see calib_defaults.h) — the user can rely on both defaults pointing at
+    // the same file. QFileDialog prompts for overwrite if it already exists;
+    // the parent directory is created on export (auto-mkdir).
+    return default_intrinsic_yml_path();
+}
+
+void CalibrationWizard::teardown_worker() {
+    if (worker_thread_) {
+        worker_thread_->quit();
+        worker_thread_->wait();
+        // worker_ has no parent and the QThread::finished → deleteLater
+        // connection is intentionally NOT used: after quit()+wait() the
+        // worker thread's event loop has already exited, so a queued
+        // deleteLater would never be processed and worker_ would leak.
+        // Delete it explicitly here (safe — its thread is already joined).
+        delete worker_;
+        delete worker_thread_;
+        worker_thread_ = nullptr;
+        worker_ = nullptr;
+    }
+}
+
+void CalibrationWizard::build_ui() {
+    auto* outer = new QVBoxLayout(this);
+
+    // ---- Top row: parameters | live camera aim-view | captured preview ----
+    // Three equal-width columns. The aim-view reuses the main display's frame
+    // (QImage implicit sharing — no deep copy); the preview holds one transient
+    // annotated image. Both stay memory-light.
+    auto* top_row = new QHBoxLayout();
+
+    // Parameters column.
+    auto* params_widget = new QWidget(this);
+    auto* form = new QFormLayout(params_widget);
+    form->setContentsMargins(0, 0, 0, 0);
+
+    // Capture window (µs), 200–200000 in 1 µs steps. The chessboard blinks at
+    // 10 ms (a 20 ms full cycle); the window must cover ≥ one full cycle so
+    // every black square fires both polarities.
+    capture_window_ = new QSpinBox(params_widget);
+    capture_window_->setRange(kCaptureWindowMinUs, kCaptureWindowMaxUs);
+    capture_window_->setSingleStep(kCaptureWindowStepUs);
+    capture_window_->setValue(kDefaultCaptureWindowUs);
+    capture_window_->setSuffix(tr(" µs"));
+    capture_window_->setToolTip(tr("Event capture window in microseconds "
+        "(200–200000). The chessboard blinks at 10 ms; the window must cover at "
+        "least one full blink cycle (20 ms) so every black square fires both "
+        "polarities. Longer windows gather a denser board signal."));
+    form->addRow(tr("Capture window"), capture_window_);
+
+    square_mm_ = new QDoubleSpinBox(params_widget);
+    square_mm_->setRange(0.0, 500.0);
+    square_mm_->setDecimals(2);
+    square_mm_->setValue(kDefaultSquareMm);
+    square_mm_->setSuffix(tr(" mm"));
+    square_mm_->setToolTip(tr("Physical length (mm) of one chessboard square "
+        "edge, measured with a ruler. Sets the real-world scale for "
+        "calibration; does NOT change the on-screen pattern size (screen DPI "
+        "is deliberately not used). 0 means not measured yet — the value is "
+        "required before exporting."));
+    form->addRow(tr("Square size"), square_mm_);
+
+    // Measurement instruction: one short sentence.
+    spacing_note_ = new QLabel(
+        tr("Measure the length of one chessboard square edge, then enter it in mm."),
+        params_widget);
+    spacing_note_->setWordWrap(true);
+    spacing_note_->setStyleSheet("font-size:11px; color:#888;");
+    form->addRow(spacing_note_);
+
+    target_frames_ = new QSpinBox(params_widget);
+    target_frames_->setRange(3, 100);
+    target_frames_->setValue(kDefaultTargetFrames);
+    form->addRow(tr("Target frames"), target_frames_);
+
+    top_row->addWidget(params_widget, 1);
+
+    // Live camera aim-view column. CalibrationCameraView uses the same
+    // approach as FocusCameraView (QPainter::drawImage in paintEvent).
+    camera_view_ = new CalibrationCameraView(this);
+    camera_view_->set_message(tr("No camera connected"));
+    top_row->addWidget(camera_view_, 1);
+
+    // Captured-frame preview column.
+    preview_area_ = new QScrollArea(this);
+    preview_area_->setAlignment(Qt::AlignCenter);
+    preview_area_->setMinimumSize(240, 180);
+    preview_label_ = new QLabel(preview_area_);
+    preview_label_->setAlignment(Qt::AlignCenter);
+    preview_label_->setText(tr("No frames captured yet."));
+    preview_area_->setWidget(preview_label_);
+    // Re-fit the preview pixmap when the viewport resizes (eventFilter).
+    preview_area_->viewport()->installEventFilter(this);
+    top_row->addWidget(preview_area_, 1);
+
+    outer->addLayout(top_row);
+
+    // ---- Large blinking chessboard pattern (full width, dominant) ----
+    pattern_ = new BlinkingChessboardDisplay(this);
+    pattern_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    pattern_->setMinimumSize(400, 200);
+    apply_pattern_to_display();
+    outer->addWidget(pattern_, 1);
+
+    // ---- Capture hint ----
+    hint_ = new QLabel(tr(
+        "Hold the camera steady and press <b>Space</b> to capture. Vary the "
+        "pose between captures; cover the center AND corners of the view "
+        "(see the coverage hull)."), this);
+    hint_->setWordWrap(true);
+    hint_->setProperty("class", "hint");
+    outer->addWidget(hint_);
+
+    // ---- Controls row: buttons + progress ----
+    auto* btns = new QHBoxLayout();
+    capture_btn_ = new QPushButton(tr("Capture"), this);
+    // "Delete this capture" sits immediately right of Capture. It discards the
+    // most recently accepted frame after the user inspects its annotated
+    // preview — that frame is then excluded from the final intrinsic
+    // calculation. Gated by can_delete_last_ (one delete per accept: a second
+    // consecutive delete that would drop the prior capture is blocked) and
+    // disabled while a capture is in flight or once the target is reached.
+    delete_capture_btn_ = new QPushButton(tr("Delete this capture"), this);
+    delete_capture_btn_->setEnabled(false);
+    delete_capture_btn_->setToolTip(tr(
+        "Discard the last accepted capture (after inspecting its preview) so it "
+        "is not used in the intrinsic calculation. Only the most recent capture "
+        "can be deleted — one delete per capture; capture again to delete the "
+        "next one."));
+    reset_btn_   = new QPushButton(tr("Reset"), this);
+    export_btn_  = new QPushButton(tr("Export..."), this);
+    enable_capture(false);
+    export_btn_->setEnabled(false);
+    btns->addWidget(capture_btn_);
+    btns->addWidget(delete_capture_btn_);
+    btns->addWidget(reset_btn_);
+    btns->addWidget(export_btn_);
+    btns->addStretch();
+    progress_ = new QProgressBar(this);
+    progress_->setRange(0, target_frames_->value());
+    btns->addWidget(progress_);
+    outer->addLayout(btns);
+
+    // ---- Status ----
+    status_ = new QLabel(this);
+    status_->setWordWrap(true);
+    outer->addWidget(status_);
+
+    // Config-change handlers. The grid is fixed at 9×6 (no cols/rows spinbox),
+    // so there is no square-grid rejection. capture_window/target are
+    // geometry-affecting (target also re-ranges the progress bar) and reset
+    // the session; square_mm is a pure re-scale and keeps every capture (see
+    // on_square_size_changed).
+    connect(capture_window_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [this](int) { on_config_changed(); });
+    connect(square_mm_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        &CalibrationWizard::on_square_size_changed);
+    connect(target_frames_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [this](int v) { progress_->setRange(0, v); on_config_changed(); });
+    connect(capture_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_capture_pressed);
+    connect(delete_capture_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_delete_capture);
+    connect(reset_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_intrinsic_reset);
+    connect(export_btn_, &QPushButton::clicked, this, &CalibrationWizard::on_export_pressed);
+
+    on_intrinsic_reset();
 }
 
 } // namespace gui

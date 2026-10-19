@@ -37,8 +37,15 @@ public:
     enum class Mode {
         BardowVariational,  ///< TV-L1 variational (Chambolle-Pock), default.
         InteractingMaps,    ///< Six-map interconnection (Cook 2011).
-        E2VID,              ///< Neural-network inference (ONNX Runtime or fallback).
+        E2VID,              ///< Neural reconstruction (rpg_e2vid, Gallego 2019).
+        E2VIDPlus,          ///< Neural reconstruction (Stoffregen ECCV 2020).
+        FireNetPlus,        ///< Lightweight neural reconstruction (ibid.).
+        HyperE2VID,         ///< Hypernetwork dynamic conv (Ercan TIP 2024).
     };
+
+    /// Neural (DL) reconstruction modes — modes 2..5 share the same
+    /// inference pipeline and differ only in the loaded ONNX model.
+    static bool mode_is_dl(Mode m) { return m >= Mode::E2VID; }
 
     /// @brief Constructs the reconstructor.
     /// @param width,height Sensor dimensions (or ROI dimensions).
@@ -62,7 +69,7 @@ public:
     /// For E2VID: buffers events for the next voxel grid + inference call.
     void process(const Event* events, std::size_t n) {
         if (events == nullptr || n == 0) return;
-        if (mode_ == Mode::E2VID) {
+        if (mode_is_dl(mode_)) {
             // Buffer events for E2VID voxel grid inference (E2VID handles
             // its own downsample internally).
             e2vid_event_buffer_.insert(e2vid_event_buffer_.end(),
@@ -104,10 +111,14 @@ public:
         // the sliding-window formulation in both Bardow (2016) and Cook
         // (2011) — no exponential decay, old events are fully discarded.
         rebuild_log_intensity();
-        // Optional exponential decay (default off — the sliding window
-        // already provides temporal locality). Users can enable it for
-        // extra smoothing via the decay_tau_ms parameter.
-        if (current_t_ > last_frame_t_ && decay_tau_ms_ > 0.0f) {
+        // Optional per-frame dimming (default off). NOTE on semantics: the
+        // scaling runs right after the full sliding-window rebuild above, so
+        // it never accumulates across frames — it exponentially dims the
+        // CURRENT frame's brightness by the inter-frame interval
+        // (exp(-dt_frame/tau)). It is NOT cross-frame temporal smoothing
+        // (the old comment claiming "extra smoothing" was wrong).
+        if (last_frame_t_ >= 0 && current_t_ > last_frame_t_ &&
+            decay_tau_ms_ > 0.0f) {
             const double dt_us =
                 static_cast<double>(current_t_ - last_frame_t_);
             const double tau_us =
@@ -124,11 +135,14 @@ public:
                 frame = reconstruct_interacting();
                 break;
             case Mode::E2VID:
+            case Mode::E2VIDPlus:
+            case Mode::FireNetPlus:
+            case Mode::HyperE2VID:
                 frame = reconstruct_e2vid();
                 break;
         }
-        // Upsample non-E2VID downsampled output back to sensor/ROI size.
-        if (mode_ != Mode::E2VID && downsample_ &&
+        // Upsample non-DL downsampled output back to sensor/ROI size.
+        if (!mode_is_dl(mode_) && downsample_ &&
             frame.rows != height_ && !frame.empty()) {
             cv::resize(frame, frame, cv::Size(width_, height_),
                        0, 0, cv::INTER_NEAREST);
@@ -169,8 +183,11 @@ public:
     void set_num_iterations(int n) { num_iterations_ = clamp_iter(n, 10, 500); }
     int num_iterations() const { return num_iterations_; }
 
-    /// @brief Sets the log-intensity decay time constant in ms.
-    /// Larger values = slower decay (longer memory); 0 disables decay.
+    /// @brief Sets the per-frame dimming time constant in ms.
+    /// Larger values = weaker dimming; 0 disables dimming.
+    /// Semantics: each get_frame() scales the freshly rebuilt log-intensity
+    /// by exp(-dt_frame/tau) — an observable per-frame brightness dimming,
+    /// not cross-frame temporal smoothing (see get_frame()).
     void set_decay_tau_ms(float ms) {
         decay_tau_ms_ = (ms < 0.0f) ? 0.0f : (ms > 5000.0f ? 5000.0f : ms);
     }
@@ -213,6 +230,18 @@ public:
     const std::string& model_path() const { return model_path_; }
     bool e2vid_model_loaded() const { return e2vid_.is_model_loaded(); }
 
+    // Inference device policy (0=Auto, 1=CPU, 2=GPU; §4.4.2-GPU). Auto runs
+    // the neural path on the OpenVINO GPU runtime when the build has it and
+    // an Intel GPU is present, degrading to ONNX Runtime CPU otherwise.
+    void set_e2v_device(int d) {
+        e2vid_.set_device(static_cast<E2VIDInference::Device>(d));
+    }
+    int e2v_device() const { return static_cast<int>(e2vid_.device()); }
+    /// "gpu" | "cpu" | "" — runtime actually in use (status line).
+    const std::string& e2v_active_runtime() const {
+        return e2vid_.active_runtime();
+    }
+
     void set_e2vid_num_bins(int b) { e2vid_.set_num_bins(b); }
     int e2vid_num_bins() const { return e2vid_.num_bins(); }
 
@@ -248,7 +277,9 @@ public:
         e2vid_event_buffer_.clear();
         intensity_rescaler_.reset();
         current_t_ = 0;
-        last_frame_t_ = 0;
+        last_frame_t_ = -1;  // -1 = no frame yet: skip dimming on the first
+                             // frame after reset (dt vs 0 would be ~1e9 us on
+                             // live cameras, dimming the frame to black).
     }
 
     int width() const { return width_; }
@@ -887,10 +918,11 @@ private:
     std::vector<WindowedEvent> event_window_;  ///< Time-ordered event buffer.
     std::vector<double> log_intensity_;
     Metavision::timestamp current_t_{0};
-    Metavision::timestamp last_frame_t_{0};   ///< Last get_frame() timestamp
-    /// Optional exponential decay for log_intensity_ (ms). Default 0
-    /// (disabled) — the sliding window already provides temporal locality.
-    /// Users can enable it for extra temporal smoothing.
+    Metavision::timestamp last_frame_t_{-1};  ///< Last get_frame() timestamp (-1 = none)
+    /// Per-frame dimming time constant (ms). Default 0 (disabled). Applied
+    /// right after the sliding-window rebuild, so it dims the current frame
+    /// by the inter-frame interval — NOT cross-frame temporal smoothing.
+    /// Kept (develop removed it) because the dimming is user-observable.
     float decay_tau_ms_{0.0f};
 
     // --- BardowVariational optimization state ---

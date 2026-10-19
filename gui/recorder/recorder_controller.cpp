@@ -6,6 +6,7 @@
 #include <metavision/sdk/stream/camera.h>
 
 #include "app/camera_controller.h"
+#include "app/frame_pipeline.h"
 
 namespace gui {
 
@@ -36,11 +37,69 @@ bool RecorderController::start(CameraController* controller, const QString& path
         return false;
     }
     // Recording is only meaningful for live cameras: a file-playback source
-    // has no underlying hardware stream and log_raw_data would silently
-    // produce an empty / corrupt file.
+    // has no underlying hardware stream to record.
     if (controller->is_file_source()) {
         emit error(tr("Recording is only available for live cameras."));
         return false;
+    }
+    // Recording while the camera is not streaming produces an empty file
+    // (audit §六-C5) — require an active stream.
+    if (!controller->is_running()) {
+        emit error(tr("Camera is not streaming. Start streaming before recording."));
+        return false;
+    }
+    // Phase 4: inivation devices (DAVIS/DVXplorer) have no SDK event stream
+    // — record the raw device stream into an AEDAT4 (DV-native) file.
+    if (controller->is_inivation_source()) {
+        const auto& info = controller->sensor_info();
+        aedat4_writer_ = std::make_shared<Aedat4Writer>();
+        if (!aedat4_writer_->open(path.toStdString(), info.width, info.height,
+                                  info.serial.toStdString(),
+                                  include_imu_,
+                                  include_aps_ && controller->source_capabilities().aps)) {
+            aedat4_writer_.reset();
+            emit error(tr("Failed to open recording file:\n%1").arg(path));
+            return false;
+        }
+        written_events_ = 0;
+        // The record dialog chooses which side streams the file includes:
+        // enable the requested streams for the recording; the user's panel
+        // state is restored on stop().
+        imu_was_enabled_ = controller->imu_enabled();
+        aps_was_enabled_ = controller->aps_enabled();
+        if (include_imu_ && !imu_was_enabled_) controller->set_imu_enabled(true);
+        if (include_aps_ && controller->source_capabilities().aps &&
+            !aps_was_enabled_) {
+            controller->set_aps_enabled(true);
+        }
+        auto writer = aedat4_writer_;  // in-flight batches outlive stop()
+        controller->set_raw_tap([this, writer](const Metavision::EventCD* b,
+                                               const Metavision::EventCD* e) {
+            writer->write(b, e);
+            written_events_ += static_cast<std::uint64_t>(e - b);
+        });
+        // The side streams enter the file only when the dialog declared
+        // them: the writer's XML/FTAB list exactly the checked streams, so
+        // an unchecked-but-streaming side stream must NOT be tapped (it
+        // would put undeclared stream data into the file).
+        if (include_imu_) {
+            controller->set_imu_tap([writer](const davis::ImuSample& s) {
+                writer->write_imu(s);
+            });
+        }
+        if (include_aps_ && controller->source_capabilities().aps) {
+            controller->set_aps_tap([writer](const davis::ApsFrame& f) {
+                writer->write_aps(f);
+            });
+        }
+        controller_ = controller;
+        path_ = path;
+        recording_ = true;
+        aedat4_mode_ = true;
+        start_time_ = std::chrono::steady_clock::now();
+        timer_.start(1000);
+        emit recording_started(path);
+        return true;
     }
     auto* camera = controller->camera_handle();
     if (!camera) {
@@ -62,6 +121,8 @@ bool RecorderController::start(CameraController* controller, const QString& path
         emit error(QString::fromUtf8(e.what()));
         return false;
     }
+    written_events_ = 0;  // otherwise the stop message shows the previous
+                          // recording's count (the AEDAT4/processed paths reset)
     controller_ = controller;
     path_ = path;
     recording_ = true;
@@ -75,6 +136,84 @@ bool RecorderController::start(CameraController* controller, const QString& path
     return true;
 }
 
+bool RecorderController::start_processed(CameraController* controller,
+                                         const QString& path, FramePipeline* fp) {
+    if (recording_ || !controller || !fp || path.isEmpty()) {
+        return false;
+    }
+    writer_error_reported_ = false;  // re-arm per recording: one dropped
+                                     // batch must not silence the next
+                                     // session's error report
+    // Same guards as raw recording: live source + active stream only. Any
+    // live source works here (the processed stream comes from the pipeline,
+    // not the SDK camera) — including inivation devices.
+    if (controller->is_file_source()) {
+        emit error(tr("Recording is only available for live cameras."));
+        return false;
+    }
+    if (!controller->is_running()) {
+        emit error(tr("Camera is not streaming. Start streaming before recording."));
+        return false;
+    }
+    int w = 0, h = 0;
+    try {
+        const auto& info = controller->sensor_info();
+        w = info.width;
+        h = info.height;
+    } catch (...) {
+        emit error(tr("Sensor geometry unavailable for processed recording."));
+        return false;
+    }
+    if (w <= 0 || h <= 0) {
+        emit error(tr("Invalid sensor geometry (%1x%2) for processed recording.").arg(w).arg(h));
+        return false;
+    }
+    try {
+        writer_ = std::make_unique<Metavision::RAWEvt2EventFileWriter>(w, h, path.toStdString());
+    } catch (const std::exception& e) {
+        emit error(QString::fromUtf8(e.what()));
+        writer_.reset();
+        return false;
+    }
+    // RAWEvt2EventFileWriter only LOGS (does not throw) when the output file
+    // cannot be opened — without this check the recording would run with the
+    // writer silently discarding every event and no file ever appearing.
+    if (!writer_->is_open()) {
+        emit error(tr("Failed to open recording file:\n%1").arg(path));
+        writer_.reset();
+        return false;
+    }
+    fp_ = fp;
+    fp_->set_processed_events_listener(
+        [this](const Metavision::EventCD* b, const Metavision::EventCD* e) {
+            // Runs on the SDK CD thread under the pipeline's
+            // display_preproc_mutex_. The EVT2 encoder throws on
+            // non-increasing timestamps (Evt3 glitch) — report once and skip
+            // the batch instead of letting it escape the SDK callback.
+            try {
+                if (writer_) {
+                    writer_->add_events(b, e);
+                    written_events_ += static_cast<std::uint64_t>(e - b);
+                }
+            } catch (const std::exception& ex) {
+                if (!writer_error_reported_) {
+                    writer_error_reported_ = true;
+                    emit error(tr("Processed recording dropped a batch: %1")
+                                   .arg(QString::fromUtf8(ex.what())));
+                }
+            } catch (...) {}
+        });
+    controller_ = controller;
+    path_ = path;
+    recording_ = true;
+    processed_mode_ = true;
+    written_events_ = 0;
+    start_time_ = std::chrono::steady_clock::now();
+    timer_.start(1000);
+    emit recording_started(path);
+    return true;
+}
+
 void RecorderController::stop() {
     if (!recording_) {
         return;
@@ -82,9 +221,42 @@ void RecorderController::stop() {
     recording_ = false;
     timer_.stop();
     flush_timer_.stop();
-    // Explicitly stop logging so buffers are flushed and the file is closed
-    // cleanly. The SDK does NOT do this implicitly on stream teardown.
-    if (controller_) {
+    if (aedat4_mode_) {
+        // Unhook the tap first (no NEW batches), then close — the shared_ptr
+        // in an in-flight tap lambda keeps the writer alive until that batch
+        // completes, and close() itself is mutex-serialized with write().
+        if (controller_) {
+            controller_->set_raw_tap(nullptr);
+            controller_->set_imu_tap(nullptr);
+            controller_->set_aps_tap(nullptr);
+            // Restore the user's side-stream panel state (the recording
+            // enabled them automatically).
+            if (!imu_was_enabled_) controller_->set_imu_enabled(false);
+            if (controller_->source_capabilities().aps && !aps_was_enabled_) {
+                controller_->set_aps_enabled(false);
+            }
+            imu_was_enabled_ = false;
+            aps_was_enabled_ = false;
+        }
+        if (aedat4_writer_) {
+            aedat4_writer_->close();
+            aedat4_writer_.reset();
+        }
+        aedat4_mode_ = false;
+    } else if (processed_mode_) {
+        // Unhook BEFORE closing the writer: clearing the listener takes the
+        // pipeline's display_preproc_mutex_, so no in-flight callback can
+        // touch the writer during/after close.
+        if (fp_) {
+            fp_->set_processed_events_listener(nullptr);
+            fp_ = nullptr;
+        }
+        if (writer_) {
+            try { writer_->close(); } catch (...) {}
+            writer_.reset();
+        }
+        processed_mode_ = false;
+    } else if (controller_) {
         if (auto* cam = controller_->camera_handle()) {
             if (auto* stream = cam->get_device().get_facility<Metavision::I_EventsStream>()) {
                 // Drain the final hardware buffer before closing the log.

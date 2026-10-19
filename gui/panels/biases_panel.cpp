@@ -2,6 +2,11 @@
 
 #include "biases_panel.h"
 
+#include <algorithm>
+
+#include <QCheckBox>
+#include <QDoubleSpinBox>
+#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
@@ -29,35 +34,175 @@ BiasesPanel::BiasesPanel(QWidget* parent) : AbstractPanel(parent) {
     hint_label_->setProperty("class", "hint");
     outer->addWidget(hint_label_);
 
-    // No inner QScrollArea — the BiasesPanel is already hosted inside the
-    // Basic tab's outer scroll area, so an inner scroll would just produce
-    // a tiny viewport with its own scrollbar (the user explicitly asked to
-    // see all bias rows at once). Using a plain layout lets the outer scroll
-    // handle overflow naturally and gives every row its full height.
-    container_ = new QWidget(this);
-    rows_layout_ = new QVBoxLayout(container_);
-    rows_layout_->setContentsMargins(8, 8, 8, 8);
+    // The bias rows live in a titled group box (matching the ESP panel's
+    // Anti-Flicker / Trail Filter / ERC sections). No inner QScrollArea —
+    // the BiasesPanel is already hosted inside the Basic tab's outer scroll
+    // area, so an inner scroll would just produce a tiny viewport with its
+    // own scrollbar (the user explicitly asked to see all bias rows at
+    // once). A plain layout lets the outer scroll handle overflow naturally
+    // and gives every row its full height. Hidden until a camera with a
+    // bias facility is connected (the hint label covers the empty states).
+    group_ = new QGroupBox(tr("BIAS"), this);
+    rows_layout_ = new QVBoxLayout(group_);
+    // The group box border + title padding already inset the content; 4 px
+    // keeps the rows close to their former position inside the frame.
+    rows_layout_->setContentsMargins(4, 4, 4, 4);
     rows_layout_->setSpacing(8);
     rows_layout_->addStretch(1);
-    outer->addWidget(container_, 1);
+    outer->addWidget(group_, 1);
+    group_->setVisible(false);
+    group_->setEnabled(false);
 
-    container_->setEnabled(false);
+    // Debounced apply for wheel/keyboard slider edits (see header, §六-U1).
+    apply_debounce_.setSingleShot(true);
+    apply_debounce_.setInterval(300);
+    connect(&apply_debounce_, &QTimer::timeout, this, [this]() {
+        // Apply every row edited in the window (in insertion order), then
+        // clear — sweeping several biases with the wheel must reach the
+        // hardware for each of them, not only the last.
+        for (const auto& name : pending_applies_) {
+            for (auto& r : rows_) {
+                if (r.name == name) {
+                    apply_value(r, r.slider->value());
+                    break;
+                }
+            }
+        }
+        pending_applies_.clear();
+    });
+
+    build_auto_bias_section(outer);
+}
+
+void BiasesPanel::build_auto_bias_section(QVBoxLayout* outer) {
+    auto_group_ = new QGroupBox(tr("AUTO BIAS"), this);
+    auto* lay = new QVBoxLayout(auto_group_);
+    lay->setContentsMargins(4, 4, 4, 4);
+    lay->setSpacing(6);
+
+    auto_bias_cb_ = new QCheckBox(tr("Enable"), auto_group_);
+    lay->addWidget(auto_bias_cb_);
+
+    // Rate band: one field per row (Min / Max, Mev/s). No artificial
+    // ceiling on the max — the hardware bias range is the real limit
+    // (spinbox max is set high enough to never bind).
+    auto make_spin = [this](double lo, double hi, double def) {
+        auto* sp = new QDoubleSpinBox(auto_group_);
+        sp->setRange(lo, hi);
+        sp->setDecimals(1);
+        sp->setSingleStep(0.5);
+        sp->setValue(def);
+        sp->setSuffix(tr(" Mev/s"));
+        return sp;
+    };
+    auto* min_row = new QWidget(auto_group_);
+    auto* min_hl = new QHBoxLayout(min_row);
+    min_hl->setContentsMargins(0, 0, 0, 0);
+    min_hl->setSpacing(6);
+    min_hl->addWidget(new QLabel(tr("Min rate"), min_row), 0);
+    rate_min_sp_ = make_spin(0.05, 1000.0, 1.0);
+    min_hl->addWidget(rate_min_sp_, 1);
+    lay->addWidget(min_row);
+    auto* max_row = new QWidget(auto_group_);
+    auto* max_hl = new QHBoxLayout(max_row);
+    max_hl->setContentsMargins(0, 0, 0, 0);
+    max_hl->setSpacing(6);
+    max_hl->addWidget(new QLabel(tr("Max rate"), max_row), 0);
+    rate_max_sp_ = make_spin(0.1, 100000.0, 50.0);
+    max_hl->addWidget(rate_max_sp_, 1);
+    lay->addWidget(max_row);
+
+    outer->addWidget(auto_group_);
+    auto_group_->setVisible(true);
+    auto_group_->setEnabled(false);
+
+    connect(auto_bias_cb_, &QCheckBox::toggled, this, [this](bool on) {
+        if (!camera_ || !camera_->set_auto_bias_enabled(on)) {
+            // File playback / sensor without usable control axes (Prophesee
+            // without diff biases): refuse and reflect the actual state.
+            QSignalBlocker b(auto_bias_cb_);
+            auto_bias_cb_->setChecked(false);
+        }
+        sync_auto_bias_ui();
+    });
+    connect(rate_min_sp_, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { apply_auto_bias_bounds(); });
+    connect(rate_max_sp_, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { apply_auto_bias_bounds(); });
+}
+
+void BiasesPanel::apply_auto_bias_bounds() {
+    if (!camera_) {
+        return;
+    }
+    // The just-edited field wins; the other follows so the pair stays a
+    // valid lo < hi band (mirrors the controller's own validation).
+    const double lo = rate_min_sp_->value();
+    const double hi = rate_max_sp_->value();
+    if (sender() == rate_min_sp_ && lo >= hi) {
+        QSignalBlocker b(rate_max_sp_);
+        rate_max_sp_->setValue(lo + 0.5);
+    } else if (sender() == rate_max_sp_ && hi <= lo) {
+        QSignalBlocker b(rate_min_sp_);
+        rate_min_sp_->setValue(std::max(0.05, hi - 0.5));
+    }
+    camera_->set_auto_bias_rate_bounds(
+        static_cast<float>(rate_min_sp_->value()),
+        static_cast<float>(rate_max_sp_->value()));
+}
+
+void BiasesPanel::sync_auto_bias_ui() {
+    const bool usable = camera_ && populated_ && camera_->is_connected() &&
+                        !camera_->is_file_source();
+    auto_group_->setEnabled(usable);
+    if (!camera_ || !usable) {
+        QSignalBlocker b(auto_bias_cb_);
+        auto_bias_cb_->setChecked(false);
+        return;
+    }
+    QSignalBlocker b(auto_bias_cb_);
+    auto_bias_cb_->setChecked(camera_->auto_bias_enabled());
+    float lo = 0.F, hi = 0.F;
+    camera_->auto_bias_rate_bounds(lo, hi);
+    QSignalBlocker b1(rate_min_sp_);
+    QSignalBlocker b2(rate_max_sp_);
+    rate_min_sp_->setValue(static_cast<double>(lo));
+    rate_max_sp_->setValue(static_cast<double>(hi));
 }
 
 void BiasesPanel::on_camera_connected(CameraController* controller) {
     camera_ = controller;
+    // Re-connect the out-of-band write notification for THIS source
+    // (the controller object outlives sources — untracked connections
+    // would stack across reconnects).
+    if (auto_bias_conn_) {
+        disconnect(auto_bias_conn_);
+    }
+    if (controller) {
+        auto_bias_conn_ = connect(controller, &CameraController::auto_bias_applied,
+                                  this, &BiasesPanel::refresh_row_values,
+                                  Qt::QueuedConnection);
+    }
     clear_rows();
     populate();
+    sync_auto_bias_ui();
 }
 
 void BiasesPanel::on_camera_disconnected() {
     camera_ = nullptr;
+    if (auto_bias_conn_) {
+        disconnect(auto_bias_conn_);
+        auto_bias_conn_ = {};
+    }
     clear_rows();
     hint_label_->setText(tr("No live camera connected."));
     hint_label_->setProperty("class", "hint");
+    hint_label_->setVisible(true);
     restyle(hint_label_);
-    container_->setEnabled(false);
+    group_->setEnabled(false);
+    group_->setVisible(false);
     populated_ = false;
+    sync_auto_bias_ui();
 }
 
 void BiasesPanel::save_to_file(const QString& path) {
@@ -119,8 +264,10 @@ void BiasesPanel::populate() {
     if (!biases) {
         hint_label_->setText(tr("Biases not supported by this camera."));
         hint_label_->setProperty("class", "hint");
+        hint_label_->setVisible(true);
         restyle(hint_label_);
-        container_->setEnabled(false);
+        group_->setEnabled(false);
+        group_->setVisible(false);
         populated_ = false;
         return;
     }
@@ -130,22 +277,26 @@ void BiasesPanel::populate() {
         all = biases->get_all_biases();
     } catch (const std::exception& e) {
         hint_label_->setText(tr("Failed to enumerate biases: %1").arg(QString::fromUtf8(e.what())));
-        container_->setEnabled(false);
+        hint_label_->setVisible(true);
+        group_->setEnabled(false);
+        group_->setVisible(false);
         populated_ = false;
         return;
     }
 
     if (all.empty()) {
         hint_label_->setText(tr("Camera reports no configurable biases."));
-        container_->setEnabled(false);
+        hint_label_->setVisible(true);
+        group_->setEnabled(false);
+        group_->setVisible(false);
         populated_ = false;
         return;
     }
 
-    hint_label_->setText(tr("%1 bias parameter(s) available. Edits apply immediately.")
-                             .arg(all.size()));
-    hint_label_->setProperty("class", "info");
-    restyle(hint_label_);
+    // The group box title carries the "BIAS" heading — hide the hint label
+    // so the text does not appear twice.
+    hint_label_->setVisible(false);
+    group_->setVisible(true);
 
     // Insert rows before the trailing stretch.
     for (const auto& [name, value] : all) {
@@ -153,7 +304,7 @@ void BiasesPanel::populate() {
         row.name = name;
         row.snapshot_value = value;
 
-        auto* row_widget = new QWidget(container_);
+        auto* row_widget = new QWidget(group_);
         row.row_widget = row_widget;
 
         // Resolve range + metadata.
@@ -196,6 +347,11 @@ void BiasesPanel::populate() {
         row.spin->setToolTip(description);
 
         auto* btn_reset = new QPushButton(tr("Reset"), row_widget);
+        // Compact padding (base.qss) trims the wide internal side border so
+        // the rows fit inside the group box frame without widening the
+        // sidebar — the width still follows the (smaller) size hint, so the
+        // text is never clipped.
+        btn_reset->setProperty("class", "compact");
 
         if (!modifiable) {
             row.slider->setEnabled(false);
@@ -218,8 +374,17 @@ void BiasesPanel::populate() {
                 [this, bias_name, spin = row.spin](int v) {
                     QSignalBlocker b(spin);
                     spin->setValue(v);
-                    // Don't apply during drag — valueChanged fires per tick
-                    // and would flood USB writes. Apply on sliderReleased.
+                    // Don't apply per tick — valueChanged fires continuously
+                    // during a drag and would flood USB writes. Drag edits
+                    // are applied on sliderReleased; wheel/keyboard edits
+                    // (which never emit sliderReleased) go through a 300 ms
+                    // debounce so they still reach the hardware (§六-U1).
+                    if (std::find(pending_applies_.begin(),
+                                  pending_applies_.end(),
+                                  bias_name) == pending_applies_.end()) {
+                        pending_applies_.push_back(bias_name);
+                    }
+                    apply_debounce_.start();
                 });
         connect(row.slider, &QSlider::sliderReleased, this,
                 [this, bias_name]() {
@@ -253,7 +418,7 @@ void BiasesPanel::populate() {
         rows_.push_back(std::move(row));
     }
 
-    container_->setEnabled(true);
+    group_->setEnabled(true);
     populated_ = true;
 }
 

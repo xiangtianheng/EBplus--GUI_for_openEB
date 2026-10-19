@@ -11,7 +11,6 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
-#include <QLabel>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStyle>
@@ -40,11 +39,6 @@ EspPanel::EspPanel(QWidget* parent) : AbstractPanel(parent) {
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(0, 0, 0, 0);
     outer->setSpacing(6);
-
-    hint_label_ = new QLabel(tr("Connect a live camera to enable ESP settings."), this);
-    hint_label_->setWordWrap(true);
-    hint_label_->setProperty("class", "hint");
-    outer->addWidget(hint_label_);
 
     // --- Anti-Flicker -----------------------------------------------------
     af_group_ = make_group(this, tr("Anti-Flicker"));
@@ -75,9 +69,17 @@ EspPanel::EspPanel(QWidget* parent) : AbstractPanel(parent) {
     af_form->addRow(tr("Freq. low"), af_low_);
     af_form->addRow(tr("Freq. high"), af_high_);
     af_duty_ = new QDoubleSpinBox(af_group_);
-    af_duty_->setRange(0.0, 1.0);
-    af_duty_->setSingleStep(0.05);
-    af_duty_->setValue(0.5);
+    af_duty_->setObjectName(QStringLiteral("esp_af_duty_cycle"));
+    // Duty cycle is a PERCENTAGE (facility get/set span 0–100; live readback
+    // is 50). The HAL's min getter reports the 1/16 register granularity as
+    // a fraction (0.0625) instead, so the true percentage floor is 100/16 =
+    // 6.25% — sub-floor values are silently clamped by the hardware and
+    // desynchronise the widget from the register.
+    af_duty_->setRange(6.25, 100.0);
+    af_duty_->setDecimals(2);
+    af_duty_->setSingleStep(1.0);
+    af_duty_->setSuffix(tr(" %"));
+    af_duty_->setValue(50.0);
     af_form->addRow(tr("Duty cycle"), af_duty_);
     af_start_thr_ = new QSpinBox(af_group_);
     af_start_thr_->setRange(0, 1000000);
@@ -169,8 +171,11 @@ EspPanel::EspPanel(QWidget* parent) : AbstractPanel(parent) {
             emit error_message(QString::fromUtf8(e.what()));
         }
     };
-    connect(af_low_,  QOverload<int>::of(&QSpinBox::valueChanged), this, apply_band);
-    connect(af_high_, QOverload<int>::of(&QSpinBox::valueChanged), this, apply_band);
+    // Validate/apply on editingFinished (Enter or focus-out) instead of
+    // valueChanged — per-keystroke validation popped a modal error box on
+    // every intermediate value while typing (audit §六-U2).
+    connect(af_low_,  &QSpinBox::editingFinished, this, apply_band);
+    connect(af_high_, &QSpinBox::editingFinished, this, apply_band);
     connect(af_duty_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (!camera_) return;
         auto* af = camera_->anti_flicker_facility();
@@ -248,9 +253,6 @@ void EspPanel::on_camera_connected(CameraController* controller) {
 void EspPanel::on_camera_disconnected() {
     camera_ = nullptr;
     set_all_enabled(false);
-    hint_label_->setText(tr("Connect a live camera to enable ESP settings."));
-    hint_label_->setProperty("class", "hint");
-    restyle(hint_label_);
 }
 
 void EspPanel::populate() {
@@ -259,17 +261,6 @@ void EspPanel::populate() {
     populate_trail();
     populate_erc();
 
-    const bool any = camera_->anti_flicker_facility() ||
-                     camera_->trail_filter_facility() ||
-                     camera_->erc_facility();
-    if (any) {
-        hint_label_->setText(tr("ESP facilities loaded. Edits apply immediately."));
-        hint_label_->setProperty("class", "info");
-    } else {
-        hint_label_->setText(tr("No ESP facilities available on this camera."));
-        hint_label_->setProperty("class", "hint");
-    }
-    restyle(hint_label_);
     // Note: do NOT call set_all_enabled(true) here — each populate_* function
     // already enables its group if the facility exists and disables it if
     // not. Calling set_all_enabled(true) afterwards would override the
@@ -298,7 +289,7 @@ void EspPanel::populate_antiflicker() {
     uint32_t min_f = 1, max_f = 100000;
     try { min_f = af->get_min_supported_frequency(); max_f = af->get_max_supported_frequency(); }
     catch (const std::exception& e) { first_err(e); }
-    float duty_min = 0.0f, duty_max = 1.0f, duty = 0.5f;
+    float duty_min = 6.25f, duty_max = 100.0f, duty = 50.0f;
     try { duty_min = af->get_min_supported_duty_cycle(); duty_max = af->get_max_supported_duty_cycle(); }
     catch (const std::exception& e) { first_err(e); }
     try { duty = af->get_duty_cycle(); }
@@ -322,11 +313,20 @@ void EspPanel::populate_antiflicker() {
     const int maxfi = static_cast<int>(std::min<uint32_t>(max_f, INT_MAX));
     QSignalBlocker b2(af_low_);
     QSignalBlocker b3(af_high_);
-    af_low_->setValue(static_cast<int>(std::min<uint32_t>(low_f, INT_MAX)));
-    af_high_->setValue(static_cast<int>(std::min<uint32_t>(high_f, INT_MAX)));
+    // setRange BEFORE setValue: with the old (1..100000) range still active,
+    // a hardware value outside it would be silently clamped and the widget
+    // would show a wrong value (audit §六-U4).
     af_low_->setRange(minfi, maxfi);
     af_high_->setRange(minfi, maxfi);
+    af_low_->setValue(static_cast<int>(std::min<uint32_t>(low_f, INT_MAX)));
+    af_high_->setValue(static_cast<int>(std::min<uint32_t>(high_f, INT_MAX)));
     QSignalBlocker b4(af_duty_);
+    // The HAL min getter reports the granularity fraction (1/16 = 0.0625),
+    // not a percentage — lift any sub-1% floor to the true 100/16 = 6.25%
+    // so the widget never offers values the hardware silently clamps.
+    if (duty_min <= 1.0f) duty_min = 100.0f / 16.0f;
+    duty_max = std::clamp(duty_max, duty_min, 100.0f);
+    duty = std::clamp(duty, duty_min, duty_max);
     af_duty_->setRange(duty_min, duty_max);
     af_duty_->setValue(duty);
     QSignalBlocker b5(af_start_thr_);

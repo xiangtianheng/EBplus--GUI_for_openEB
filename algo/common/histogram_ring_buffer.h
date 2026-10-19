@@ -2,7 +2,7 @@
 //
 // Maintains a bounded rolling window of scalar samples (ISI, direction,
 // polarity, latency) and computes a histogram + summary statistics (mean, std,
-// percentiles). Used by isi_analyzer, direction consensus, and latency probes.
+// percentiles). Used by direction consensus, latency probes, and percentile stats.
 // Header-only; O(1) push, O(bins) stats.
 
 #ifndef GUI_ALGO_COMMON_HISTOGRAM_RING_BUFFER_H
@@ -77,6 +77,10 @@ public:
     /// @brief Returns the @p q-th percentile in [0, 100] of the current window.
     double percentile(double q) const {
         if (samples_.empty()) return 0.0;
+        // Clamp q to [0, 100] (§四-低7): out-of-range q was UB via the
+        // (tmp.size()-1) scaled index.
+        if (q < 0.0) q = 0.0;
+        else if (q > 100.0) q = 100.0;
         std::vector<double> tmp(samples_.begin(), samples_.end());
         std::sort(tmp.begin(), tmp.end());
         const double pos = (q / 100.0) * (tmp.size() - 1);
