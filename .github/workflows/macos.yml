@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "3"
+
 jobs:
   build-app:
     name: Build Apple Silicon app
@@ -60,7 +67,7 @@ jobs:
             -DGUI_FOR_OPENEB_BUILD_TESTS=ON \
             -DGUI_BUILD_TESTS=ON \
             -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/build/openeb-install;$(brew --prefix)"
-          cmake --build build/macos-tests --parallel
+          cmake --build build/macos-tests --parallel "$CMAKE_BUILD_PARALLEL_LEVEL"
           ctest --test-dir build/macos-tests --output-on-failure
 
   package-dmg:

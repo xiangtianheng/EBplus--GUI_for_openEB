@@ -60,6 +60,7 @@ Useful overrides:
 ```bash
 ARCH=arm64 BUILD_TYPE=Release ./scripts/build_macos_app.sh
 CREATE_DMG=OFF ./scripts/build_macos_app.sh
+CMAKE_BUILD_PARALLEL_LEVEL=3 CREATE_DMG=OFF ./scripts/build_macos_app.sh
 QT_PREFIX=/opt/homebrew/opt/qtbase ./scripts/build_macos_app.sh
 QTSVG_PREFIX=/opt/homebrew/opt/qtsvg ./scripts/build_macos_app.sh
 ```
@@ -153,6 +154,10 @@ installed ONNX weights. CTest reports unavailable fixtures as skipped. Live
 DAVIS/DVXplorer USB operation still requires hardware validation on macOS.
 
 ## Signing And Distribution
+
+The macOS CI limits compilation to three jobs per runner and cancels older
+runs of the same pull request or branch. Local builds default to the host's
+logical CPU count; `CMAKE_BUILD_PARALLEL_LEVEL` overrides it.
 
 The macOS CI checks pull requests into `develop-MacOS` and pushes to that
 branch. Successful app jobs upload `EBplus-macos-arm64-app.zip`, created with
